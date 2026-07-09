@@ -9,10 +9,6 @@ from typing import Any
 REWARD_NAME = "ui_s1_step"
 REWARD_TYPE = "batch"
 
-SCREEN_WIDTH = 1080.0
-SCREEN_HEIGHT = 2400.0
-
-
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
@@ -81,9 +77,22 @@ def point_in_bbox(point: tuple[float, float], bbox: tuple[float, float, float, f
     return (x1 - pad_x) <= x <= (x2 + pad_x) and (y1 - pad_y) <= y <= (y2 + pad_y)
 
 
-def normalized_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
-    dx = (a[0] - b[0]) / SCREEN_WIDTH
-    dy = (a[1] - b[1]) / SCREEN_HEIGHT
+def screen_size(action: dict[str, Any]) -> tuple[float, float]:
+    dim = action.get("device_dim")
+    if isinstance(dim, (list, tuple)) and len(dim) >= 2:
+        try:
+            width = max(float(dim[0]), 1.0)
+            height = max(float(dim[1]), 1.0)
+            return width, height
+        except (TypeError, ValueError):
+            pass
+    return 1080.0, 2400.0
+
+
+def normalized_distance(a: tuple[float, float], b: tuple[float, float], size: tuple[float, float]) -> float:
+    width, height = size
+    dx = (a[0] - b[0]) / width
+    dy = (a[1] - b[1]) / height
     return math.sqrt(dx * dx + dy * dy)
 
 
@@ -97,7 +106,7 @@ def score_point_action(pred: dict[str, Any], gt: dict[str, Any]) -> float:
     if gt_bbox is not None:
         return 1.0 if point_in_bbox(pred_point, gt_bbox) else 0.0
 
-    return 1.0 if normalized_distance(pred_point, gt_point) <= 0.08 else 0.0
+    return 1.0 if normalized_distance(pred_point, gt_point, screen_size(gt)) <= 0.08 else 0.0
 
 
 def vector(start: tuple[float, float], end: tuple[float, float]) -> tuple[float, float]:
@@ -120,8 +129,9 @@ def score_swipe(pred: dict[str, Any], gt: dict[str, Any]) -> float:
         return 0.0
 
     cosine = (pred_vec[0] * gt_vec[0] + pred_vec[1] * gt_vec[1]) / (pred_norm * gt_norm)
-    start_ok = normalized_distance(pred_start, gt_start) <= 0.25
-    end_ok = normalized_distance(pred_end, gt_end) <= 0.25
+    size = screen_size(gt)
+    start_ok = normalized_distance(pred_start, gt_start, size) <= 0.25
+    end_ok = normalized_distance(pred_end, gt_end, size) <= 0.25
     return 1.0 if cosine >= 0.7 and (start_ok or end_ok) else 0.0
 
 
