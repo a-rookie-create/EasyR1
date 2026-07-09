@@ -92,6 +92,10 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
+    semi_online: bool = False
+    """enable UI-S1-style semi-online trajectory rollout"""
+    patch_threshold: int = 0
+    """number of expert-action patches allowed after action mismatch; -1 means unlimited"""
 
 
 @dataclass

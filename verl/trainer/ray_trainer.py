@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface.
 
 import json
 import os
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -28,6 +29,7 @@ from typing import Any, Optional, Type
 import numpy as np
 import ray
 import torch
+from jinja2 import Template
 from ray.experimental.tqdm_ray import tqdm
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizer, ProcessorMixin
@@ -37,6 +39,7 @@ from ..single_controller.base import Worker
 from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
+from ..utils.dataset import process_image
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
 from ..utils.logger import Tracker
 from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
@@ -155,6 +158,39 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     return data
 
 
+def _extract_json_object(text: str) -> str:
+    match = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
+    return match.group(0) if match else (text or "").strip()
+
+
+def _format_action_for_history(response: str, fallback_action: str) -> str:
+    extracted = _extract_json_object(response)
+    try:
+        parsed = json.loads(extracted)
+    except Exception:
+        return fallback_action
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
+
+def _history_text(history: list[str]) -> str:
+    if not history:
+        return "None"
+    return "\n".join(f"{idx}. {action}" for idx, action in enumerate(history, start=1))
+
+
+def _build_semi_online_prompt(goal: str, history: list[str], format_prompt: Optional[str] = None) -> str:
+    content = (
+        "<image>\n"
+        f"Goal: {goal.strip()}\n\n"
+        "Previous actions:\n"
+        f"{_history_text(history)}\n\n"
+        "Predict the next Android GUI action. Return only one compact JSON object."
+    )
+    if format_prompt:
+        return Template(format_prompt.strip()).render(content=content)
+    return content
+
+
 class RayPPOTrainer:
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
@@ -180,6 +216,10 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self._semi_online_format_prompt = None
+        if config.data.format_prompt:
+            with open(config.data.format_prompt, encoding="utf-8") as f:
+                self._semi_online_format_prompt = f.read()
 
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
@@ -463,6 +503,237 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _encode_semi_online_examples(self, examples: list[dict[str, Any]], meta_info: dict[str, Any]) -> DataProto:
+        tensors = defaultdict(list)
+        non_tensors = defaultdict(list)
+
+        for example in examples:
+            messages = [{"role": "user", "content": []}]
+            prompt = example["prompt"]
+            content = []
+            for i, text in enumerate(prompt.split("<image>")):
+                if i != 0:
+                    content.append({"type": "image"})
+                if text:
+                    content.append({"type": "text", "text": text})
+            messages[0]["content"] = content
+
+            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            images = example["images"]
+            processed_images = [process_image(image, meta_info["min_pixels"], meta_info["max_pixels"]) for image in images]
+            model_inputs = self.processor(processed_images, [raw_prompt], add_special_tokens=False, return_tensors="pt")
+            input_ids = model_inputs.pop("input_ids")[0]
+            attention_mask = model_inputs.pop("attention_mask")[0]
+
+            if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+                if "Qwen3VLProcessor" in self.processor.__class__.__name__:
+                    from ..models.transformers.qwen3_vl import get_rope_index
+                else:
+                    from ..models.transformers.qwen2_vl import get_rope_index
+
+                vision_position_ids = get_rope_index(
+                    self.processor,
+                    input_ids=input_ids,
+                    image_grid_thw=model_inputs.get("image_grid_thw", None),
+                    video_grid_thw=model_inputs.get("video_grid_thw", None),
+                    second_per_grid_ts=model_inputs.get("second_per_grid_ts", None),
+                    attention_mask=attention_mask,
+                )
+                text_position_ids = torch.arange(len(input_ids)).unsqueeze(0)
+                position_ids = torch.cat((text_position_ids, vision_position_ids), dim=0)
+            else:
+                position_ids = torch.clip(attention_mask.cumsum(dim=0) - 1, min=0, max=None)
+
+            input_ids, attention_mask, position_ids = VF.postprocess_data(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                max_length=self.config.data.max_prompt_length,
+                pad_token_id=self.tokenizer.pad_token_id,
+                left_pad=True,
+                truncation="error",
+            )
+            raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+            if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+
+            tensors["input_ids"].append(input_ids)
+            tensors["attention_mask"].append(attention_mask)
+            tensors["position_ids"].append(position_ids)
+            non_tensors["raw_prompt_ids"].append(raw_prompt_ids)
+            non_tensors["multi_modal_data"].append({"images": images})
+            non_tensors["ground_truth"].append(example["answer"])
+            non_tensors["uid"].append(example["uid"])
+            non_tensors["traj_uid"].append(example["traj_uid"])
+            non_tensors["step_id"].append(example["step_id"])
+            non_tensors["task_id"].append(example["task_id"])
+            non_tensors["rollout_id"].append(example["rollout_id"])
+
+        tensor_batch = {key: torch.stack(value, dim=0) for key, value in tensors.items()}
+        non_tensor_batch = {key: np.array(value, dtype=object) for key, value in non_tensors.items()}
+        return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=meta_info)
+
+    def _filter_grpo_groups(self, batch: DataProto) -> DataProto:
+        uid_counts = defaultdict(int)
+        for uid in batch.non_tensor_batch["uid"]:
+            uid_counts[uid] += 1
+        kept = [idx for idx, uid in enumerate(batch.non_tensor_batch["uid"]) if uid_counts[uid] > 1]
+        if not kept:
+            raise RuntimeError("No semi-online rollout group has at least two samples for GRPO.")
+        if len(kept) < len(batch):
+            print(f"Filtered {len(batch) - len(kept)} semi-online samples with singleton GRPO groups.")
+        return batch[kept]
+
+    def _trim_to_world_size_by_grpo_group(self, batch: DataProto) -> DataProto:
+        world_size = self.actor_rollout_ref_wg.world_size
+        remainder = len(batch) % world_size
+        if remainder == 0:
+            return batch
+
+        uid_to_indices = defaultdict(list)
+        for idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+            uid_to_indices[uid].append(idx)
+
+        dropped_uids = set()
+        dropped_count = 0
+        for uid, indices in sorted(uid_to_indices.items(), key=lambda item: len(item[1])):
+            dropped_uids.add(uid)
+            dropped_count += len(indices)
+            if (len(batch) - dropped_count) % world_size == 0:
+                break
+
+        kept = [idx for idx, uid in enumerate(batch.non_tensor_batch["uid"]) if uid not in dropped_uids]
+        if not kept:
+            raise RuntimeError("No semi-online samples remain after trimming batch to world size.")
+        print(f"Trimmed {len(batch) - len(kept)} semi-online samples to match world size {world_size}.")
+        return batch[kept]
+
+    def _make_semi_online_batch_data(self, metrics: dict[str, Any]) -> DataProto:
+        print("Start generating semi-online trajectory batch...")
+        try:
+            batch_dict = next(self.data_iterator)
+        except StopIteration:
+            self.data_iterator = iter(self.train_dataloader)
+            batch_dict = next(self.data_iterator)
+
+        source_batch = DataProto.from_single_dict(batch_dict)
+        if "trajectory_steps" not in source_batch.non_tensor_batch:
+            raise RuntimeError("algorithm.semi_online=true requires trajectory-level data with `trajectory_steps`.")
+
+        states = []
+        rollout_n = self.config.worker.rollout.n
+        for row_idx in range(len(source_batch)):
+            task_id = str(source_batch.non_tensor_batch.get("task_id", np.array([row_idx], dtype=object))[row_idx])
+            goal = str(source_batch.non_tensor_batch["goal"][row_idx])
+            steps = list(source_batch.non_tensor_batch["trajectory_steps"][row_idx])
+            for rollout_id in range(rollout_n):
+                states.append(
+                    {
+                        "task_id": task_id,
+                        "traj_uid": str(uuid.uuid4()),
+                        "rollout_id": rollout_id,
+                        "goal": goal,
+                        "steps": steps,
+                        "step_pos": 0,
+                        "history": [],
+                        "patch_count": 0,
+                        "finished": False,
+                    }
+                )
+
+        meta_info = {
+            "min_pixels": self.config.data.min_pixels,
+            "max_pixels": self.config.data.max_pixels,
+            "video_fps": self.config.data.video_fps,
+            "n": 1,
+        }
+        step_batches = []
+        reward_metrics_all = defaultdict(list)
+
+        while True:
+            active_indices = [
+                idx for idx, state in enumerate(states) if not state["finished"] and state["step_pos"] < len(state["steps"])
+            ]
+            if not active_indices:
+                break
+
+            examples = []
+            for state_idx in active_indices:
+                state = states[state_idx]
+                step = state["steps"][state["step_pos"]]
+                step_id = step.get("step_id", state["step_pos"])
+                answer = json.dumps(step["action"], ensure_ascii=False, separators=(",", ":"))
+                examples.append(
+                    {
+                        "prompt": _build_semi_online_prompt(
+                            state["goal"], state["history"], self._semi_online_format_prompt
+                        ),
+                        "answer": answer,
+                        "images": [step["image"]],
+                        "uid": f"{state['task_id']}:{step_id}",
+                        "traj_uid": state["traj_uid"],
+                        "step_id": step_id,
+                        "task_id": state["task_id"],
+                        "rollout_id": state["rollout_id"],
+                        "state_idx": state_idx,
+                    }
+                )
+
+            step_batch = self._encode_semi_online_examples(examples, meta_info=meta_info)
+            gen_batch = step_batch.pop(
+                batch_keys=["input_ids", "attention_mask", "position_ids"],
+                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
+            )
+            gen_batch.meta_info["n"] = 1
+            gen_batch, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_ref_wg.world_size)
+            gen_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+            gen_output = unpad_dataproto(gen_output, pad_size=pad_size)
+            step_batch = step_batch.union(gen_output)
+
+            reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(step_batch))
+            step_batch.batch["token_level_scores"] = reward_tensor
+            for key, values in reward_metrics.items():
+                reward_metrics_all[key].extend(values)
+                step_batch.non_tensor_batch[key] = np.array(values, dtype=object)
+
+            extract_match = []
+            response_lengths = torch.sum(step_batch.batch["response_mask"], dim=-1)
+            for row_idx, example in enumerate(examples):
+                state = states[example["state_idx"]]
+                gt_action = example["answer"]
+                response_len = int(response_lengths[row_idx].item())
+                response_ids = step_batch.batch["responses"][row_idx][:response_len]
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                accuracy = reward_metrics.get("accuracy", [0.0] * len(examples))[row_idx]
+                matched = float(accuracy) >= 1.0
+                extract_match.append(matched)
+
+                if matched:
+                    state["history"].append(_format_action_for_history(response_text, gt_action))
+                    state["step_pos"] += 1
+                else:
+                    patch_threshold = self.config.algorithm.patch_threshold
+                    can_patch = patch_threshold == -1 or state["patch_count"] < patch_threshold
+                    if can_patch:
+                        state["history"].append(gt_action)
+                        state["patch_count"] += 1
+                        state["step_pos"] += 1
+                    else:
+                        state["finished"] = True
+
+            step_batch.non_tensor_batch["extract_match"] = np.array(extract_match, dtype=object)
+            step_batches.append(step_batch)
+
+        if not step_batches:
+            raise RuntimeError("Semi-online rollout produced no training samples.")
+
+        batch = DataProto.concat(step_batches)
+        batch = self._filter_grpo_groups(batch)
+        batch = self._trim_to_world_size_by_grpo_group(batch)
+        metrics.update({f"reward/{key}": value for key, value in reduce_metrics(reward_metrics_all).items()})
+        return batch
+
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -590,7 +861,10 @@ class RayPPOTrainer:
                 # make a batch of data
                 with timer("gen", timing_raw):
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
-                    batch = self._make_batch_data(metrics=metrics)
+                    if self.config.algorithm.semi_online:
+                        batch = self._make_semi_online_batch_data(metrics=metrics)
+                    else:
+                        batch = self._make_batch_data(metrics=metrics)
                     self.actor_rollout_ref_wg.release_rollout_engine()
 
                 # balance the number of valid tokens on each dp rank.
