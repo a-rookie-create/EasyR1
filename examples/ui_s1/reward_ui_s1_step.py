@@ -23,6 +23,7 @@ OPTIONAL_ACTION_ARGUMENTS = {
     "long_press": ("time",),
 }
 TERMINATE_STATUSES = {"success", "failure"}
+SYSTEM_BUTTONS = {"back", "home", "enter"}
 MODEL_RESPONSE_PATTERN = re.compile(
     r"\s*<thinking>(?P<thinking>.*?)</thinking>\s*"
     r"<tool_call>\s*(?P<tool_call>\{.*\})\s*</tool_call>\s*",
@@ -58,10 +59,12 @@ def is_valid_action_schema(action: Any, allow_reward_metadata: bool = False) -> 
                 return False
         except (TypeError, ValueError):
             return False
-    if action_name == "system_button" and action["button"] not in {"Back", "Home", "Enter"}:
-        return False
-    if action_name == "terminate" and action["status"] not in TERMINATE_STATUSES:
-        return False
+    if action_name == "system_button":
+        if not isinstance(action["button"], str) or normalize_text(action["button"]) not in SYSTEM_BUTTONS:
+            return False
+    if action_name == "terminate":
+        if not isinstance(action["status"], str) or normalize_text(action["status"]) not in TERMINATE_STATUSES:
+            return False
     return True
 
 
@@ -192,8 +195,13 @@ def score_time_field(pred: dict[str, Any], gt: dict[str, Any]) -> float:
         return 0.0
 
 
-def vector(start: tuple[float, float], end: tuple[float, float]) -> tuple[float, float]:
-    return end[0] - start[0], end[1] - start[1]
+def swipe_direction(start: tuple[float, float], end: tuple[float, float]) -> str | None:
+    delta_x, delta_y = end[0] - start[0], end[1] - start[1]
+    if delta_x == 0.0 and delta_y == 0.0:
+        return None
+    if abs(delta_x) > abs(delta_y):
+        return "right" if delta_x > 0.0 else "left"
+    return "down" if delta_y > 0.0 else "up"
 
 
 def score_swipe(pred: dict[str, Any], gt: dict[str, Any]) -> float:
@@ -204,18 +212,7 @@ def score_swipe(pred: dict[str, Any], gt: dict[str, Any]) -> float:
     if None in (pred_start, pred_end, gt_start, gt_end):
         return 0.0
 
-    pred_vec = vector(pred_start, pred_end)
-    gt_vec = vector(gt_start, gt_end)
-    pred_norm = math.hypot(*pred_vec)
-    gt_norm = math.hypot(*gt_vec)
-    if pred_norm == 0.0 or gt_norm == 0.0:
-        return 0.0
-
-    cosine = (pred_vec[0] * gt_vec[0] + pred_vec[1] * gt_vec[1]) / (pred_norm * gt_norm)
-    size = screen_size(gt)
-    start_ok = normalized_distance(pred_start, gt_start, size) <= 0.25
-    end_ok = normalized_distance(pred_end, gt_end, size) <= 0.25
-    return 1.0 if cosine >= 0.7 and (start_ok or end_ok) else 0.0
+    return 1.0 if swipe_direction(pred_start, pred_end) == swipe_direction(gt_start, gt_end) else 0.0
 
 
 def score_text_field(pred: dict[str, Any], gt: dict[str, Any], key: str) -> float:
@@ -240,7 +237,8 @@ def score_action(pred: dict[str, Any], gt: dict[str, Any]) -> float:
             return 1.0
         return score_text_field(pred, gt, "status")
     if action_type == "wait":
-        return score_time_field(pred, gt)
+        # Wait duration is syntactic metadata, not an expert-action match target.
+        return 1.0
     return 0.0
 
 

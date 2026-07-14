@@ -19,6 +19,33 @@ class UIS1AdvantageResult:
     step_advantages: torch.Tensor
 
 
+def rollout_score_std(scores: Sequence[float]) -> float:
+    """Population standard deviation used to screen one task's rollout pool."""
+    if len(scores) < 2:
+        return 0.0
+    return float(torch.tensor(scores, dtype=torch.float64).std(unbiased=False).item())
+
+
+def replace_nearest_rollout(
+    selected_scores: Sequence[float], candidate_score: float
+) -> tuple[bool, int | None, float, float]:
+    """Keep a new rollout only when it is farther from the expanded-pool mean.
+
+    Returns ``(replace, selected_index, candidate_distance, nearest_distance)``.
+    Scores are trajectory-level aggregates of the final UI-S1 advantage.
+    """
+    if not selected_scores:
+        return True, None, 0.0, 0.0
+
+    pool = [float(value) for value in selected_scores] + [float(candidate_score)]
+    mean = sum(pool) / len(pool)
+    distances = [abs(value - mean) for value in selected_scores]
+    nearest_index = min(range(len(distances)), key=distances.__getitem__)
+    candidate_distance = abs(float(candidate_score) - mean)
+    nearest_distance = distances[nearest_index]
+    return candidate_distance > nearest_distance, nearest_index, candidate_distance, nearest_distance
+
+
 def _key(value: Any) -> str:
     return str(value)
 
