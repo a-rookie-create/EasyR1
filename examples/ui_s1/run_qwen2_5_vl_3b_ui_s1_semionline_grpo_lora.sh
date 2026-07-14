@@ -1,29 +1,47 @@
 #!/bin/bash
 
-set -e
+# Source-agnostic formal UI-S1 semi-online GRPO LoRA runner.
+# Select AndroidControl or AMEX through DATA_DIR.
+set -euo pipefail
+shopt -s nullglob
 
 MODEL_PATH=${MODEL_PATH:-/home/zst/biye215/llamafactory/output/ui_s1_qwen25vl_3b_android_control_amex_lora_full_3gpu_merged}
-DATA_DIR=${DATA_DIR:-/home/zst/biye215/datasets/ui_s1_easy_r1}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen2_5_vl_3b_amex_semionline_grpo_lora_smoke}
-RUN_LOG_DIR=${RUN_LOG_DIR:-/home/zst/biye215/EasyR1/logs/ui_s1}
+DATA_DIR=${DATA_DIR:-/home/zst/biye215/EasyR1/datasets/ui_s1_android_control_rl}
+OUTPUT_ROOT=${OUTPUT_ROOT:-/home/zst/biye215/EasyR1/output}
+DATASET_LABEL=${DATASET_LABEL:-$(basename "${DATA_DIR}")}
+RUN_NAME=${RUN_NAME:-ui_s1_qwen25vl_3b_${DATASET_LABEL}_semionline_grpo_lora_$(date +%Y%m%d_%H%M%S)}
+RUN_DIR=${OUTPUT_ROOT}/${RUN_NAME}
 GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,1,2}}
+
+# Paper-aligned values are kept where three 24 GB GPUs permit them. Batch and rollout counts stay conservative.
+EPOCHS=${EPOCHS:-5}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-3}
 ACTOR_GLOBAL_BATCH_SIZE=${ACTOR_GLOBAL_BATCH_SIZE:-3}
+ROLLOUT_N=${ROLLOUT_N:-8}
+GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE:-3}
+MAX_ROLLOUTS_PER_TASK=${MAX_ROLLOUTS_PER_TASK:-20}
+HISTORY_IMAGE_LIMIT=${HISTORY_IMAGE_LIMIT:-2}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-12288}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.75}
-VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-12288}
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-12800}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-24576}
-# Paper baseline is one patch; override this environment variable for ablations.
 PATCH_THRESHOLD=${PATCH_THRESHOLD:-1}
 UIS1_GAMMA=${UIS1_GAMMA:-0.5}
 UIS1_STEP_ADVANTAGE_WEIGHT=${UIS1_STEP_ADVANTAGE_WEIGHT:-1.0}
 UIS1_EPISODE_ADVANTAGE_WEIGHT=${UIS1_EPISODE_ADVANTAGE_WEIGHT:-1.0}
 UIS1_ADVANTAGE_STD_THRESHOLD=${UIS1_ADVANTAGE_STD_THRESHOLD:-0.3}
+SAVE_EVERY_N_EPOCHS=${SAVE_EVERY_N_EPOCHS:-1}
 
-mkdir -p "${RUN_LOG_DIR}"
-RUN_LOG=${RUN_LOG:-${RUN_LOG_DIR}/${EXPERIMENT_NAME}_$(date +%Y%m%d_%H%M%S).log}
+if [[ -e "${RUN_DIR}" ]]; then
+    echo "Refusing to reuse existing run directory: ${RUN_DIR}" >&2
+    echo "Set RUN_NAME to a new value so checkpoints and rollout logs cannot be mixed." >&2
+    exit 2
+fi
+mkdir -p "${RUN_DIR}"
+RUN_LOG=${RUN_LOG:-${RUN_DIR}/train.log}
 exec > >(tee -a "${RUN_LOG}") 2>&1
 set -x
-echo "Writing run log to ${RUN_LOG}"
 
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 IFS=',' read -ra GPU_ID_ARRAY <<< "${GPU_IDS}"
@@ -31,18 +49,29 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-${#GPU_ID_ARRAY[@]}}
 
 cd /home/zst/biye215/EasyR1
 
-python3 -B -c "import json, pathlib; data=pathlib.Path('${DATA_DIR}/amex_train_trajectories.jsonl'); assert data.exists(), f'missing train file: {data}'; first=json.loads(data.read_text(encoding='utf-8').splitlines()[0]); image=pathlib.Path(first['trajectory_steps'][0]['image']); assert image.exists(), f'missing first screenshot: {image}'"
+if [[ -z "${TRAIN_FILE:-}" ]]; then
+    train_candidates=("${DATA_DIR}"/*_train.jsonl)
+    [[ ${#train_candidates[@]} -eq 1 ]] || { echo "Expected one *_train.jsonl in ${DATA_DIR}" >&2; exit 2; }
+    TRAIN_FILE=${train_candidates[0]}
+fi
+if [[ -z "${VAL_FILE:-}" ]]; then
+    val_candidates=("${DATA_DIR}"/*_val.jsonl)
+    [[ ${#val_candidates[@]} -eq 1 ]] || { echo "Expected one *_val.jsonl in ${DATA_DIR}" >&2; exit 2; }
+    VAL_FILE=${val_candidates[0]}
+fi
+
+python3 -B -c "import json, pathlib; data=pathlib.Path('${TRAIN_FILE}'); assert data.exists(), f'missing train file: {data}'; first=json.loads(data.read_text(encoding='utf-8').splitlines()[0]); image=pathlib.Path(first['trajectory_steps'][0]['image']); assert image.exists(), f'missing first screenshot: {image}'"
 
 python3 -m verl.trainer.main \
     config=examples/config.yaml \
-    data.train_files=${DATA_DIR}/amex_train_trajectories.jsonl \
-    data.val_files=${DATA_DIR}/amex_val_trajectories.jsonl \
+    data.train_files=${TRAIN_FILE} \
+    data.val_files=${VAL_FILE} \
     data.prompt_key=prompt \
     data.answer_key=answer \
     data.image_key=images \
     data.image_dir=null \
-    data.max_prompt_length=8192 \
-    data.max_response_length=256 \
+    data.max_prompt_length=${MAX_PROMPT_LENGTH} \
+    data.max_response_length=${MAX_RESPONSE_LENGTH} \
     data.rollout_batch_size=${ROLLOUT_BATCH_SIZE} \
     data.val_batch_size=1 \
     data.format_prompt=examples/ui_s1/format_prompt/ui_s1_android.jinja \
@@ -55,6 +84,9 @@ python3 -m verl.trainer.main \
     algorithm.semi_online_episode_advantage_weight=${UIS1_EPISODE_ADVANTAGE_WEIGHT} \
     algorithm.semi_online_normalize_by_std=true \
     algorithm.semi_online_advantage_std_threshold=${UIS1_ADVANTAGE_STD_THRESHOLD} \
+    algorithm.semi_online_image_limit=${HISTORY_IMAGE_LIMIT} \
+    algorithm.semi_online_generation_micro_batch_size=${GENERATION_MICRO_BATCH_SIZE} \
+    algorithm.semi_online_max_rollouts_per_task=${MAX_ROLLOUTS_PER_TASK} \
     algorithm.use_kl_loss=true \
     algorithm.kl_coef=1.0e-4 \
     worker.actor.global_batch_size=${ACTOR_GLOBAL_BATCH_SIZE} \
@@ -67,22 +99,27 @@ python3 -m verl.trainer.main \
     worker.actor.model.lora.target_modules=all-linear \
     worker.actor.model.lora.exclude_modules='.*visual.*' \
     worker.actor.optim.lr=1.0e-6 \
-    worker.rollout.n=2 \
+    worker.rollout.n=${ROLLOUT_N} \
     worker.rollout.temperature=0.9 \
     worker.rollout.top_p=0.95 \
-    worker.rollout.limit_images=1 \
+    worker.rollout.limit_images=${HISTORY_IMAGE_LIMIT} \
     worker.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION} \
     worker.rollout.tensor_parallel_size=1 \
     worker.rollout.max_model_len=${VLLM_MAX_MODEL_LEN} \
     worker.rollout.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS} \
     worker.reward.reward_function=examples/ui_s1/reward_ui_s1_step.py:compute_score \
-    trainer.max_steps=1 \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=${EPOCHS} \
     trainer.project_name=easy_r1_ui_s1 \
-    trainer.experiment_name=${EXPERIMENT_NAME} \
+    trainer.experiment_name=${RUN_NAME} \
     trainer.logger='["console","file"]' \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes=1 \
     trainer.val_before_train=false \
     trainer.val_freq=-1 \
-    trainer.save_freq=-1
+    trainer.save_freq=-1 \
+    trainer.save_every_n_epochs=${SAVE_EVERY_N_EPOCHS} \
+    trainer.save_limit=-1 \
+    trainer.save_model_only=false \
+    trainer.save_checkpoint_path=${RUN_DIR} \
+    trainer.rollout_log_path=${RUN_DIR}/semi_online_rollouts.jsonl \
+    trainer.find_last_checkpoint=false
