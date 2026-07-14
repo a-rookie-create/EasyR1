@@ -158,18 +158,32 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     return data
 
 
-def _extract_json_object(text: str) -> str:
-    match = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
-    return match.group(0) if match else (text or "").strip()
-
-
-def _format_action_for_history(response: str, fallback_action: str) -> str:
-    extracted = _extract_json_object(response)
+def _tool_call_from_action(action: str) -> str:
     try:
-        parsed = json.loads(extracted)
+        parsed = json.loads(action)
     except Exception:
-        return fallback_action
-    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        return action
+    if not isinstance(parsed, dict):
+        return action
+    if parsed.get("name") == "mobile_use" and isinstance(parsed.get("arguments"), dict):
+        parsed = parsed["arguments"]
+    if not isinstance(parsed, dict) or "action" not in parsed:
+        return action
+    tool_call = {"name": "mobile_use", "arguments": parsed}
+    return f"<tool_call>\n{json.dumps(tool_call, ensure_ascii=False, separators=(',', ':'))}\n</tool_call>"
+
+
+def _format_model_response_for_history(response: str, fallback_action: str) -> str:
+    raw_response = (response or "").strip()
+    tool_call = re.search(r"<tool_call>\s*(\{.*\})\s*</tool_call>", raw_response, flags=re.DOTALL)
+    if tool_call:
+        try:
+            parsed = json.loads(tool_call.group(1))
+            if parsed.get("name") == "mobile_use" and isinstance(parsed.get("arguments"), dict):
+                return raw_response
+        except Exception:
+            pass
+    return _tool_call_from_action(fallback_action)
 
 
 def _history_text(history: list[str]) -> str:
@@ -182,13 +196,47 @@ def _build_semi_online_prompt(goal: str, history: list[str], format_prompt: Opti
     content = (
         "<image>\n"
         f"Goal: {goal.strip()}\n\n"
-        "Previous actions:\n"
+        "Previous model outputs:\n"
         f"{_history_text(history)}\n\n"
-        "Predict the next Android GUI action. Return only one compact JSON object."
+        "Predict the next Android GUI action using the required thinking and tool-call format."
     )
     if format_prompt:
         return Template(format_prompt.strip()).render(content=content)
     return content
+
+
+def _attach_ui_s1_advantages(data: DataProto, config: PPOConfig) -> dict[str, float]:
+    """Attach UI-S1 equations (9)-(12) without changing the generic GRPO path."""
+    # Keep UI-S1 experiment code out of EasyR1's normal trainer import path.
+    from examples.ui_s1.advantage_ui_s1 import compute_ui_s1_advantages
+
+    result = compute_ui_s1_advantages(
+        token_level_rewards=data.batch["token_level_scores"],
+        response_mask=data.batch["response_mask"],
+        task_ids=data.non_tensor_batch["task_id"],
+        trajectory_ids=data.non_tensor_batch["traj_uid"],
+        step_ids=data.non_tensor_batch["step_id"],
+        extract_matches=data.non_tensor_batch["extract_match"],
+        gamma=config.algorithm.semi_online_gamma,
+        step_advantage_weight=config.algorithm.semi_online_step_advantage_weight,
+        episode_advantage_weight=config.algorithm.semi_online_episode_advantage_weight,
+        normalize_by_std=config.algorithm.semi_online_normalize_by_std,
+    )
+    data.batch["advantages"] = result.advantages
+    data.batch["returns"] = result.returns
+    data.batch["ui_s1_step_returns"] = result.step_returns
+    data.batch["ui_s1_episode_returns"] = result.episode_returns
+    data.batch["ui_s1_episode_advantages"] = result.episode_advantages
+    data.batch["ui_s1_step_advantages"] = result.step_advantages
+
+    valid_advantages = result.advantages.masked_select(data.batch["response_mask"].bool())
+    advantage_std = torch.std(valid_advantages, unbiased=False).item() if valid_advantages.numel() > 1 else 0.0
+    return {
+        "uis1/advantage_std": advantage_std,
+        "uis1/step_reward_mean": result.step_rewards.mean().item(),
+        "uis1/step_return_mean": result.step_returns.mean().item(),
+        "uis1/episode_return_mean": result.episode_returns.mean().item(),
+    }
 
 
 class RayPPOTrainer:
@@ -710,13 +758,13 @@ class RayPPOTrainer:
                 extract_match.append(matched)
 
                 if matched:
-                    state["history"].append(_format_action_for_history(response_text, gt_action))
+                    state["history"].append(_format_model_response_for_history(response_text, gt_action))
                     state["step_pos"] += 1
                 else:
                     patch_threshold = self.config.algorithm.patch_threshold
                     can_patch = patch_threshold == -1 or state["patch_count"] < patch_threshold
                     if can_patch:
-                        state["history"].append(gt_action)
+                        state["history"].append(_tool_call_from_action(gt_action))
                         state["patch_count"] += 1
                         state["step_pos"] += 1
                     else:
@@ -729,7 +777,11 @@ class RayPPOTrainer:
             raise RuntimeError("Semi-online rollout produced no training samples.")
 
         batch = DataProto.concat(step_batches)
-        batch = self._filter_grpo_groups(batch)
+        ui_s1_metrics = _attach_ui_s1_advantages(batch, self.config)
+        batch.meta_info["ui_s1_metrics"] = ui_s1_metrics
+
+        # Episode advantages remain meaningful for singleton later steps, so do
+        # not discard them merely because a same-step GRPO group became smaller.
         batch = self._trim_to_world_size_by_grpo_group(batch)
         metrics.update({f"reward/{key}": value for key, value in reduce_metrics(reward_metrics_all).items()})
         return batch
@@ -853,6 +905,8 @@ class RayPPOTrainer:
                 return
 
         self.data_iterator = iter(self.train_dataloader)
+        if self.config.algorithm.semi_online and not self.config.algorithm.use_kl_loss:
+            raise ValueError("UI-S1 semi-online RL requires algorithm.use_kl_loss=true so KL remains separate from returns.")
         while self.global_step < self.training_steps:
             self.global_step += 1
 
@@ -862,7 +916,26 @@ class RayPPOTrainer:
                 with timer("gen", timing_raw):
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
                     if self.config.algorithm.semi_online:
-                        batch = self._make_semi_online_batch_data(metrics=metrics)
+                        max_attempts = self.config.trainer.max_try_make_batch
+                        for attempt in range(1, max_attempts + 1):
+                            candidate_metrics: dict[str, Any] = {}
+                            batch = self._make_semi_online_batch_data(metrics=candidate_metrics)
+                            ui_s1_metrics = batch.meta_info.get("ui_s1_metrics", {})
+                            advantage_std = float(ui_s1_metrics.get("uis1/advantage_std", 0.0))
+                            threshold = self.config.algorithm.semi_online_advantage_std_threshold
+                            if threshold <= 0.0 or advantage_std > threshold:
+                                metrics.update(candidate_metrics)
+                                metrics.update(ui_s1_metrics)
+                                break
+                            if attempt == max_attempts:
+                                raise RuntimeError(
+                                    "UI-S1 DAPO filtering could not find a batch with sufficient advantage variance: "
+                                    f"std={advantage_std:.4f}, threshold={threshold}, attempts={max_attempts}."
+                                )
+                            print(
+                                "UI-S1 DAPO resampling: "
+                                f"advantage_std={advantage_std:.4f} <= threshold={threshold} (attempt {attempt}/{max_attempts})"
+                            )
                     else:
                         batch = self._make_batch_data(metrics=metrics)
                     self.actor_rollout_ref_wg.release_rollout_engine()
@@ -913,13 +986,15 @@ class RayPPOTrainer:
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
+                    # Semi-online batches already carry trajectory-level UI-S1
+                    # advantages. All other algorithms use EasyR1's native path.
+                    if not self.config.algorithm.semi_online:
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
 
                 # update critic
                 if self.use_critic:
