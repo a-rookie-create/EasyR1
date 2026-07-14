@@ -32,7 +32,8 @@ def build_prompt(goal: str, history: list[dict[str, Any]]) -> str:
         f"Goal: {goal.strip()}\n\n"
         "Previous actions:\n"
         f"{format_history(history)}\n\n"
-        "Predict the next Android GUI action. Return only one compact JSON object."
+        "Predict the next Android GUI action. Return <thinking></thinking> followed by a "
+        "<tool_call> containing {\"name\":\"mobile_use\",\"arguments\":{...}}."
     )
 
 
@@ -70,7 +71,7 @@ def amex_step_to_action(step: dict[str, Any]) -> dict[str, Any]:
     elif action_type == "TASK_COMPLETE":
         action = {"action": "terminate", "status": "success"}
     elif action_type == "TASK_IMPOSSIBLE":
-        action = {"action": "terminate", "status": "impossible"}
+        action = {"action": "terminate", "status": "failure"}
     else:
         action = {"action": action_type.lower()}
 

@@ -2,7 +2,7 @@
 
 set -e
 
-MODEL_PATH=${MODEL_PATH:-/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-/home/zst/biye215/llamafactory/output/ui_s1_qwen25vl_3b_android_control_amex_lora_full_3gpu_merged}
 DATA_DIR=${DATA_DIR:-/home/zst/biye215/datasets/ui_s1_easy_r1}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen2_5_vl_3b_amex_semionline_grpo_lora_smoke}
 RUN_LOG_DIR=${RUN_LOG_DIR:-/home/zst/biye215/EasyR1/logs/ui_s1}
@@ -12,6 +12,12 @@ ACTOR_GLOBAL_BATCH_SIZE=${ACTOR_GLOBAL_BATCH_SIZE:-3}
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.75}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-12288}
 VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-24576}
+# Paper baseline is one patch; override this environment variable for ablations.
+PATCH_THRESHOLD=${PATCH_THRESHOLD:-1}
+UIS1_GAMMA=${UIS1_GAMMA:-0.5}
+UIS1_STEP_ADVANTAGE_WEIGHT=${UIS1_STEP_ADVANTAGE_WEIGHT:-1.0}
+UIS1_EPISODE_ADVANTAGE_WEIGHT=${UIS1_EPISODE_ADVANTAGE_WEIGHT:-1.0}
+UIS1_ADVANTAGE_STD_THRESHOLD=${UIS1_ADVANTAGE_STD_THRESHOLD:-0.3}
 
 mkdir -p "${RUN_LOG_DIR}"
 RUN_LOG=${RUN_LOG:-${RUN_LOG_DIR}/${EXPERIMENT_NAME}_$(date +%Y%m%d_%H%M%S).log}
@@ -43,7 +49,12 @@ python3 -m verl.trainer.main \
     data.filter_overlong_prompts=false \
     algorithm.adv_estimator=grpo \
     algorithm.semi_online=true \
-    algorithm.patch_threshold=2 \
+    algorithm.patch_threshold=${PATCH_THRESHOLD} \
+    algorithm.semi_online_gamma=${UIS1_GAMMA} \
+    algorithm.semi_online_step_advantage_weight=${UIS1_STEP_ADVANTAGE_WEIGHT} \
+    algorithm.semi_online_episode_advantage_weight=${UIS1_EPISODE_ADVANTAGE_WEIGHT} \
+    algorithm.semi_online_normalize_by_std=true \
+    algorithm.semi_online_advantage_std_threshold=${UIS1_ADVANTAGE_STD_THRESHOLD} \
     algorithm.use_kl_loss=true \
     algorithm.kl_coef=1.0e-4 \
     worker.actor.global_batch_size=${ACTOR_GLOBAL_BATCH_SIZE} \
