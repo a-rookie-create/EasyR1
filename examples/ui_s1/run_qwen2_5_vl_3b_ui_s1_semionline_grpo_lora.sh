@@ -26,12 +26,18 @@ ROLLOUT_N=${ROLLOUT_N:-8}
 # token batching can otherwise combine several shorter multimodal steps.
 ACTOR_DYNAMIC_BATCHING=${ACTOR_DYNAMIC_BATCHING:-false}
 ACTOR_USE_TORCH_COMPILE=${ACTOR_USE_TORCH_COMPILE:-false}
+# `Compute log probs` is also constrained to one multimodal UI step per
+# device. The reference worker inherits this value from the actor config.
+EXPERIENCE_MICRO_BATCH_SIZE=${EXPERIENCE_MICRO_BATCH_SIZE:-1}
 # Generate one task group at a time on the two-card setup; ROLLOUT_N stays 8.
 GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE:-1}
 MAX_ROLLOUTS_PER_TASK=${MAX_ROLLOUTS_PER_TASK:-20}
 HISTORY_IMAGE_LIMIT=${HISTORY_IMAGE_LIMIT:-2}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-12288}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
+# Qwen2.5-VL image preprocessing cap. Keep the current 4 MP default unless a
+# single unusually large screenshot is the source of an OOM.
+MAX_IMAGE_PIXELS=${MAX_IMAGE_PIXELS:-4194304}
 # 2 x RTX 3090: FSDP shards are larger than in the three-GPU run.
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.62}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-12800}
@@ -90,6 +96,7 @@ python3 -m verl.trainer.main \
     data.image_dir=null \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
+    data.max_pixels=${MAX_IMAGE_PIXELS} \
     data.rollout_batch_size=${ROLLOUT_BATCH_SIZE} \
     data.val_batch_size=1 \
     data.format_prompt=examples/ui_s1/format_prompt/ui_s1_android.jinja \
@@ -109,7 +116,7 @@ python3 -m verl.trainer.main \
     algorithm.kl_coef=1.0e-4 \
     worker.actor.global_batch_size=${ACTOR_GLOBAL_BATCH_SIZE} \
     worker.actor.micro_batch_size_per_device_for_update=1 \
-    worker.actor.micro_batch_size_per_device_for_experience=1 \
+    worker.actor.micro_batch_size_per_device_for_experience=${EXPERIENCE_MICRO_BATCH_SIZE} \
     worker.actor.dynamic_batching=${ACTOR_DYNAMIC_BATCHING} \
     worker.actor.use_torch_compile=${ACTOR_USE_TORCH_COMPILE} \
     worker.actor.model.model_path=${MODEL_PATH} \
