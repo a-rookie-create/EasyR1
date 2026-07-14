@@ -182,3 +182,11 @@ tensorboard_log/
 # data
 images/
 images*
+
+# Generated UI-S1 trajectory data and image links.
+/datasets/
+
+# Formal RL run artifacts are generated under per-run directories.
+/output/*
+/output/**
+!/output/.gitkeep
