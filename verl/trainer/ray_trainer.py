@@ -192,10 +192,14 @@ def _history_text(history: list[str]) -> str:
     return "\n".join(f"{idx}. {action}" for idx, action in enumerate(history, start=1))
 
 
-def _build_semi_online_prompt(goal: str, history: list[str], format_prompt: Optional[str] = None) -> str:
+def _build_semi_online_prompt(
+    goal: str, history: list[str], image_count: int = 1, format_prompt: Optional[str] = None
+) -> str:
+    if image_count < 1:
+        raise ValueError(f"semi-online prompts require at least one image, got {image_count}")
     content = (
-        "<image>\n"
-        f"Goal: {goal.strip()}\n\n"
+        "<image>\n" * image_count
+        + f"Goal: {goal.strip()}\n\n"
         "Previous model outputs:\n"
         f"{_history_text(history)}\n\n"
         "Predict the next Android GUI action using the required thinking and tool-call format."
@@ -272,6 +276,7 @@ class RayPPOTrainer:
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
         self.best_global_step = None
+        self._semi_online_rollout_records: list[dict[str, Any]] = []
 
         self.hybrid_engine = config.worker.hybrid_engine
         self.role_worker_mapping = role_worker_mapping
@@ -325,15 +330,51 @@ class RayPPOTrainer:
 
         if config.trainer.max_steps is not None:
             self.training_steps = config.trainer.max_steps
+            self.steps_per_epoch = len(train_dataloader)
         elif config.data.mini_rollout_batch_size is not None:
             num_examples = len(train_dataloader) * config.data.mini_rollout_batch_size
-            self.training_steps = num_examples // config.data.rollout_batch_size * config.trainer.total_epochs
+            self.steps_per_epoch = num_examples // config.data.rollout_batch_size
+            self.training_steps = self.steps_per_epoch * config.trainer.total_epochs
         else:
-            self.training_steps = len(train_dataloader) * config.trainer.total_epochs
+            self.steps_per_epoch = len(train_dataloader)
+            self.training_steps = self.steps_per_epoch * config.trainer.total_epochs
 
         config.worker.actor.optim.training_steps = self.training_steps
         config.worker.critic.optim.training_steps = self.training_steps
         print(f"Total training steps: {self.training_steps}")
+
+    def _should_save_checkpoint(self) -> bool:
+        by_step = self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0
+        epoch_interval = self.config.trainer.save_every_n_epochs
+        by_epoch = (
+            epoch_interval > 0
+            and self.steps_per_epoch > 0
+            and self.global_step % (self.steps_per_epoch * epoch_interval) == 0
+        )
+        return by_step or by_epoch
+
+    def _write_semi_online_rollout_logs(
+        self, records: list[dict[str, Any]], candidate_attempt: int, accepted_for_update: bool, advantage_std: float
+    ) -> None:
+        if not records:
+            return
+        log_path = self.config.trainer.rollout_log_path
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(
+                    json.dumps(
+                        {
+                            "global_step": self.global_step,
+                            "candidate_attempt": candidate_attempt,
+                            "accepted_for_update": accepted_for_update,
+                            "advantage_std": advantage_std,
+                            **record,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
 
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
@@ -658,6 +699,7 @@ class RayPPOTrainer:
 
     def _make_semi_online_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         print("Start generating semi-online trajectory batch...")
+        self._semi_online_rollout_records = []
         try:
             batch_dict = next(self.data_iterator)
         except StopIteration:
@@ -669,25 +711,50 @@ class RayPPOTrainer:
             raise RuntimeError("algorithm.semi_online=true requires trajectory-level data with `trajectory_steps`.")
 
         states = []
+        selection_groups: dict[str, dict[str, Any]] = {}
         rollout_n = self.config.worker.rollout.n
+        image_limit = self.config.algorithm.semi_online_image_limit
+        generation_micro_batch_size = self.config.algorithm.semi_online_generation_micro_batch_size
+        max_rollouts_per_task = self.config.algorithm.semi_online_max_rollouts_per_task
+        if image_limit < 1:
+            raise ValueError("algorithm.semi_online_image_limit must be at least 1")
+        if generation_micro_batch_size < 0:
+            raise ValueError("algorithm.semi_online_generation_micro_batch_size must be non-negative")
+        if max_rollouts_per_task < rollout_n:
+            raise ValueError("algorithm.semi_online_max_rollouts_per_task must be at least worker.rollout.n")
         for row_idx in range(len(source_batch)):
             task_id = str(source_batch.non_tensor_batch.get("task_id", np.array([row_idx], dtype=object))[row_idx])
             goal = str(source_batch.non_tensor_batch["goal"][row_idx])
             steps = list(source_batch.non_tensor_batch["trajectory_steps"][row_idx])
+            group_key = f"{row_idx}:{task_id}"
+            group = {
+                "task_id": task_id,
+                "goal": goal,
+                "steps": steps,
+                "selected": [],
+                "candidate_count": 0,
+                "pending_candidate": None,
+            }
+            selection_groups[group_key] = group
             for rollout_id in range(rollout_n):
-                states.append(
-                    {
-                        "task_id": task_id,
-                        "traj_uid": str(uuid.uuid4()),
-                        "rollout_id": rollout_id,
-                        "goal": goal,
-                        "steps": steps,
-                        "step_pos": 0,
-                        "history": [],
-                        "patch_count": 0,
-                        "finished": False,
-                    }
-                )
+                state = {
+                    "task_id": task_id,
+                    "selection_group_key": group_key,
+                    "traj_uid": str(uuid.uuid4()),
+                    "rollout_id": rollout_id,
+                    "goal": goal,
+                    "steps": steps,
+                    "step_pos": 0,
+                    "history": [],
+                    "patch_count": 0,
+                    "finished": False,
+                    "events": [],
+                    "selected_for_update": True,
+                    "selection_reason": "initial_rollout_retained",
+                }
+                states.append(state)
+                group["selected"].append(state)
+                group["candidate_count"] += 1
 
         meta_info = {
             "min_pixels": self.config.data.min_pixels,
@@ -696,28 +763,133 @@ class RayPPOTrainer:
             "n": 1,
         }
         step_batches = []
-        reward_metrics_all = defaultdict(list)
+
+        def group_raw_total_advantages(group_states: list[dict[str, Any]]) -> dict[str, float]:
+            from examples.ui_s1.advantage_ui_s1 import compute_ui_s1_advantages
+
+            trajectory_ids = {state["traj_uid"] for state in group_states}
+            candidate_batch = DataProto.concat(step_batches)
+            rows = [
+                index
+                for index, traj_uid in enumerate(candidate_batch.non_tensor_batch["traj_uid"])
+                if traj_uid in trajectory_ids
+            ]
+            candidate_batch = candidate_batch[rows]
+            result = compute_ui_s1_advantages(
+                token_level_rewards=candidate_batch.batch["token_level_scores"],
+                response_mask=candidate_batch.batch["response_mask"],
+                task_ids=candidate_batch.non_tensor_batch["task_id"],
+                trajectory_ids=candidate_batch.non_tensor_batch["traj_uid"],
+                step_ids=candidate_batch.non_tensor_batch["step_id"],
+                extract_matches=candidate_batch.non_tensor_batch["extract_match"],
+                gamma=self.config.algorithm.semi_online_gamma,
+                step_advantage_weight=self.config.algorithm.semi_online_step_advantage_weight,
+                episode_advantage_weight=self.config.algorithm.semi_online_episode_advantage_weight,
+                normalize_by_std=False,
+            )
+
+            totals = defaultdict(float)
+            counts = defaultdict(int)
+            response_mask = candidate_batch.batch["response_mask"].bool()
+            for row_idx, traj_uid in enumerate(candidate_batch.non_tensor_batch["traj_uid"]):
+                token_count = int(response_mask[row_idx].sum().item())
+                if token_count == 0:
+                    continue
+                step_advantage = float(
+                    result.advantages[row_idx].masked_select(response_mask[row_idx]).mean().item()
+                )
+                totals[str(traj_uid)] += step_advantage
+                counts[str(traj_uid)] += 1
+            return {traj_uid: totals[traj_uid] / counts[traj_uid] for traj_uid in totals if counts[traj_uid] > 0}
 
         while True:
             active_indices = [
                 idx for idx, state in enumerate(states) if not state["finished"] and state["step_pos"] < len(state["steps"])
             ]
             if not active_indices:
+                from examples.ui_s1.advantage_ui_s1 import replace_nearest_rollout, rollout_score_std
+
+                added_candidates = False
+                for group in selection_groups.values():
+                    pending_candidate = group["pending_candidate"]
+                    selected_states = group["selected"]
+                    if pending_candidate is not None:
+                        pool_scores = group_raw_total_advantages(selected_states + [pending_candidate])
+                        for state in selected_states + [pending_candidate]:
+                            state["selection_advantage"] = pool_scores[state["traj_uid"]]
+                        selected_scores = [pool_scores[state["traj_uid"]] for state in selected_states]
+                        candidate_score = pool_scores[pending_candidate["traj_uid"]]
+                        replace, nearest_index, candidate_distance, nearest_distance = replace_nearest_rollout(selected_scores, candidate_score)
+                        pending_candidate["selected_for_update"] = False
+                        pending_candidate["selection_reason"] = "candidate_too_close_to_mean"
+                        if replace:
+                            removed_state = selected_states[nearest_index]
+                            removed_state["selected_for_update"] = False
+                            removed_state["selection_reason"] = "replaced_by_more_diverse_candidate"
+                            pending_candidate["selected_for_update"] = True
+                            pending_candidate["selection_reason"] = "replaced_nearest_to_mean"
+                            selected_states[nearest_index] = pending_candidate
+                            print(
+                                "UI-S1 rollout selection: replaced a near-mean rollout "
+                                f"(new distance={candidate_distance:.4f}, removed distance={nearest_distance:.4f})."
+                            )
+                        group["pending_candidate"] = None
+
+                    selection_scores = group_raw_total_advantages(selected_states)
+                    for state in selected_states:
+                        state["selection_advantage"] = selection_scores[state["traj_uid"]]
+                    diversity_std = rollout_score_std(list(selection_scores.values()))
+                    group["selection_scores"] = selection_scores
+                    group["diversity_std"] = diversity_std
+                    group["diversity_threshold_met"] = (
+                        self.config.algorithm.semi_online_advantage_std_threshold <= 0.0
+                        or diversity_std > self.config.algorithm.semi_online_advantage_std_threshold
+                    )
+                    if group["diversity_threshold_met"] or group["candidate_count"] >= max_rollouts_per_task:
+                        continue
+
+                    rollout_id = group["candidate_count"]
+                    candidate = {
+                        "task_id": group["task_id"],
+                        "selection_group_key": next(
+                            key for key, value in selection_groups.items() if value is group
+                        ),
+                        "traj_uid": str(uuid.uuid4()),
+                        "rollout_id": rollout_id,
+                        "goal": group["goal"],
+                        "steps": group["steps"],
+                        "step_pos": 0,
+                        "history": [],
+                        "patch_count": 0,
+                        "finished": False,
+                        "events": [],
+                        "selected_for_update": False,
+                        "selection_reason": "pending_diversity_candidate",
+                    }
+                    states.append(candidate)
+                    group["pending_candidate"] = candidate
+                    group["candidate_count"] += 1
+                    added_candidates = True
+
+                if added_candidates:
+                    continue
                 break
 
-            examples = []
+            all_examples = []
             for state_idx in active_indices:
                 state = states[state_idx]
                 step = state["steps"][state["step_pos"]]
                 step_id = step.get("step_id", state["step_pos"])
                 answer = json.dumps(step["action"], ensure_ascii=False, separators=(",", ":"))
-                examples.append(
+                image_start = max(0, state["step_pos"] - image_limit + 1)
+                images = [item["image"] for item in state["steps"][image_start : state["step_pos"] + 1]]
+                all_examples.append(
                     {
                         "prompt": _build_semi_online_prompt(
-                            state["goal"], state["history"], self._semi_online_format_prompt
+                            state["goal"], state["history"], image_count=len(images), format_prompt=self._semi_online_format_prompt
                         ),
                         "answer": answer,
-                        "images": [step["image"]],
+                        "images": images,
                         "uid": f"{state['task_id']}:{step_id}",
                         "traj_uid": state["traj_uid"],
                         "step_id": step_id,
@@ -727,63 +899,141 @@ class RayPPOTrainer:
                     }
                 )
 
-            step_batch = self._encode_semi_online_examples(examples, meta_info=meta_info)
-            gen_batch = step_batch.pop(
-                batch_keys=["input_ids", "attention_mask", "position_ids"],
-                non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
-                meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
-            )
-            gen_batch.meta_info["n"] = 1
-            gen_batch, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_ref_wg.world_size)
-            gen_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
-            gen_output = unpad_dataproto(gen_output, pad_size=pad_size)
-            step_batch = step_batch.union(gen_output)
+            chunk_size = generation_micro_batch_size or len(all_examples)
+            for chunk_start in range(0, len(all_examples), chunk_size):
+                examples = all_examples[chunk_start : chunk_start + chunk_size]
+                step_batch = self._encode_semi_online_examples(examples, meta_info=meta_info)
+                gen_batch = step_batch.pop(
+                    batch_keys=["input_ids", "attention_mask", "position_ids"],
+                    non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                    meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
+                )
+                gen_batch.meta_info["n"] = 1
+                gen_batch, pad_size = pad_dataproto_to_divisor(gen_batch, self.actor_rollout_ref_wg.world_size)
+                gen_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+                gen_output = unpad_dataproto(gen_output, pad_size=pad_size)
+                step_batch = step_batch.union(gen_output)
 
-            reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(step_batch))
-            step_batch.batch["token_level_scores"] = reward_tensor
-            for key, values in reward_metrics.items():
-                reward_metrics_all[key].extend(values)
-                step_batch.non_tensor_batch[key] = np.array(values, dtype=object)
+                reward_tensor, reward_metrics = ray.get(self.reward_fn.compute_reward.remote(step_batch))
+                step_batch.batch["token_level_scores"] = reward_tensor
+                for key, values in reward_metrics.items():
+                    step_batch.non_tensor_batch[key] = np.array(values, dtype=object)
 
-            extract_match = []
-            response_lengths = torch.sum(step_batch.batch["response_mask"], dim=-1)
-            for row_idx, example in enumerate(examples):
-                state = states[example["state_idx"]]
-                gt_action = example["answer"]
-                response_len = int(response_lengths[row_idx].item())
-                response_ids = step_batch.batch["responses"][row_idx][:response_len]
-                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-                accuracy = reward_metrics.get("accuracy", [0.0] * len(examples))[row_idx]
-                matched = float(accuracy) >= 1.0
-                extract_match.append(matched)
+                extract_match = []
+                response_lengths = torch.sum(step_batch.batch["response_mask"], dim=-1)
+                for row_idx, example in enumerate(examples):
+                    state = states[example["state_idx"]]
+                    gt_action = example["answer"]
+                    response_len = int(response_lengths[row_idx].item())
+                    response_ids = step_batch.batch["responses"][row_idx][:response_len]
+                    response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                    accuracy = reward_metrics.get("accuracy", [0.0] * len(examples))[row_idx]
+                    matched = float(accuracy) >= 1.0
+                    extract_match.append(matched)
+                    patched = False
+                    termination_reason = None
 
-                if matched:
-                    state["history"].append(_format_model_response_for_history(response_text, gt_action))
-                    state["step_pos"] += 1
-                else:
-                    patch_threshold = self.config.algorithm.patch_threshold
-                    can_patch = patch_threshold == -1 or state["patch_count"] < patch_threshold
-                    if can_patch:
-                        state["history"].append(_tool_call_from_action(gt_action))
-                        state["patch_count"] += 1
+                    if matched:
+                        state["history"].append(_format_model_response_for_history(response_text, gt_action))
                         state["step_pos"] += 1
                     else:
-                        state["finished"] = True
+                        patch_threshold = self.config.algorithm.patch_threshold
+                        can_patch = patch_threshold == -1 or state["patch_count"] < patch_threshold
+                        if can_patch:
+                            state["history"].append(_tool_call_from_action(gt_action))
+                            state["patch_count"] += 1
+                            state["step_pos"] += 1
+                            patched = True
+                        else:
+                            state["finished"] = True
+                            termination_reason = "patch_threshold_exhausted"
 
-            step_batch.non_tensor_batch["extract_match"] = np.array(extract_match, dtype=object)
-            step_batches.append(step_batch)
+                    state["events"].append(
+                        {
+                            "step_id": example["step_id"],
+                            "images": example["images"],
+                            "expert_action": json.loads(gt_action),
+                            "model_response": response_text,
+                            "reward": {
+                                key: float(values[row_idx])
+                                for key, values in reward_metrics.items()
+                                if row_idx < len(values)
+                            },
+                            "action_match": matched,
+                            "patch_applied": patched,
+                            "patch_count_after_step": state["patch_count"],
+                            "termination_reason": termination_reason,
+                        }
+                    )
+
+                step_batch.non_tensor_batch["extract_match"] = np.array(extract_match, dtype=object)
+                step_batches.append(step_batch)
 
         if not step_batches:
             raise RuntimeError("Semi-online rollout produced no training samples.")
 
         batch = DataProto.concat(step_batches)
+        selected_trajectory_ids = {
+            state["traj_uid"] for group in selection_groups.values() for state in group["selected"]
+        }
+        selected_rows = [
+            index for index, traj_uid in enumerate(batch.non_tensor_batch["traj_uid"]) if traj_uid in selected_trajectory_ids
+        ]
+        batch = batch[selected_rows]
         ui_s1_metrics = _attach_ui_s1_advantages(batch, self.config)
+        ui_s1_metrics.update(
+            {
+                "uis1/diversity_group_std_mean": float(
+                    np.mean([group["diversity_std"] for group in selection_groups.values()])
+                ),
+                "uis1/diversity_groups_threshold_met": float(
+                    sum(group["diversity_threshold_met"] for group in selection_groups.values())
+                ),
+                "uis1/diversity_groups_max_pool_reached": float(
+                    sum(
+                        group["candidate_count"] == max_rollouts_per_task and not group["diversity_threshold_met"]
+                        for group in selection_groups.values()
+                    )
+                ),
+            }
+        )
         batch.meta_info["ui_s1_metrics"] = ui_s1_metrics
+        selected_states = [state for group in selection_groups.values() for state in group["selected"]]
+        self._semi_online_rollout_records = [
+            {
+                "task_id": state["task_id"],
+                "trajectory_id": state["traj_uid"],
+                "rollout_id": state["rollout_id"],
+                "goal": state["goal"],
+                "expert_step_count": len(state["steps"]),
+                "generated_step_count": len(state["events"]),
+                "patch_count": state["patch_count"],
+                "patch_threshold": self.config.algorithm.patch_threshold,
+                "episode_return": sum(float(event["reward"].get("overall", 0.0)) for event in state["events"]),
+                "selection_advantage": state.get("selection_advantage"),
+                "candidate_pool_size": selection_groups[state["selection_group_key"]]["candidate_count"],
+                "diversity_std": selection_groups[state["selection_group_key"]]["diversity_std"],
+                "diversity_threshold_met": selection_groups[state["selection_group_key"]]["diversity_threshold_met"],
+                "selected_for_update": state["selected_for_update"],
+                "selection_reason": state["selection_reason"],
+                "reached_trajectory_end": state["step_pos"] >= len(state["steps"]),
+                "termination_reason": "expert_trajectory_exhausted"
+                if state["step_pos"] >= len(state["steps"])
+                else "patch_threshold_exhausted",
+                "events": state["events"],
+            }
+            for state in selected_states
+        ]
 
         # Episode advantages remain meaningful for singleton later steps, so do
         # not discard them merely because a same-step GRPO group became smaller.
         batch = self._trim_to_world_size_by_grpo_group(batch)
-        metrics.update({f"reward/{key}": value for key, value in reduce_metrics(reward_metrics_all).items()})
+        selected_reward_metrics = defaultdict(list)
+        for state in selected_states:
+            for event in state["events"]:
+                for key, value in event["reward"].items():
+                    selected_reward_metrics[key].append(value)
+        metrics.update({f"reward/{key}": value for key, value in reduce_metrics(selected_reward_metrics).items()})
         return batch
 
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
@@ -916,26 +1166,15 @@ class RayPPOTrainer:
                 with timer("gen", timing_raw):
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
                     if self.config.algorithm.semi_online:
-                        max_attempts = self.config.trainer.max_try_make_batch
-                        for attempt in range(1, max_attempts + 1):
-                            candidate_metrics: dict[str, Any] = {}
-                            batch = self._make_semi_online_batch_data(metrics=candidate_metrics)
-                            ui_s1_metrics = batch.meta_info.get("ui_s1_metrics", {})
-                            advantage_std = float(ui_s1_metrics.get("uis1/advantage_std", 0.0))
-                            threshold = self.config.algorithm.semi_online_advantage_std_threshold
-                            if threshold <= 0.0 or advantage_std > threshold:
-                                metrics.update(candidate_metrics)
-                                metrics.update(ui_s1_metrics)
-                                break
-                            if attempt == max_attempts:
-                                raise RuntimeError(
-                                    "UI-S1 DAPO filtering could not find a batch with sufficient advantage variance: "
-                                    f"std={advantage_std:.4f}, threshold={threshold}, attempts={max_attempts}."
-                                )
-                            print(
-                                "UI-S1 DAPO resampling: "
-                                f"advantage_std={advantage_std:.4f} <= threshold={threshold} (attempt {attempt}/{max_attempts})"
-                            )
+                        candidate_metrics: dict[str, Any] = {}
+                        batch = self._make_semi_online_batch_data(metrics=candidate_metrics)
+                        ui_s1_metrics = batch.meta_info.get("ui_s1_metrics", {})
+                        advantage_std = float(ui_s1_metrics.get("uis1/advantage_std", 0.0))
+                        self._write_semi_online_rollout_logs(
+                            self._semi_online_rollout_records, 1, True, advantage_std
+                        )
+                        metrics.update(candidate_metrics)
+                        metrics.update(ui_s1_metrics)
                     else:
                         batch = self._make_batch_data(metrics=metrics)
                     self.actor_rollout_ref_wg.release_rollout_engine()
@@ -1023,7 +1262,7 @@ class RayPPOTrainer:
 
                     metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
+                if self._should_save_checkpoint():
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
 
@@ -1048,5 +1287,5 @@ class RayPPOTrainer:
 
             print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
 
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
+        if not self._should_save_checkpoint():
             self._save_checkpoint()

@@ -106,6 +106,12 @@ class AlgorithmConfig:
     """normalize UI-S1 advantages by rollout-group standard deviation"""
     semi_online_advantage_std_threshold: float = 0.3
     """minimum UI-S1 advantage standard deviation before accepting a rollout batch; 0 disables it"""
+    semi_online_image_limit: int = 1
+    """number of most recent trajectory screenshots retained for each semi-online prompt, including current"""
+    semi_online_generation_micro_batch_size: int = 0
+    """maximum active trajectories generated together; 0 generates all active trajectories together"""
+    semi_online_max_rollouts_per_task: int = 20
+    """maximum candidates sampled per task before selecting rollout.n trajectories for one UI-S1 update"""
 
 
 @dataclass
@@ -138,12 +144,16 @@ class TrainerConfig:
     """number of generations to log for validation"""
     save_freq: int = -1
     """save frequency, -1 means no saving"""
+    save_every_n_epochs: int = 0
+    """save at each N completed epochs; 0 disables epoch-based checkpointing"""
     save_limit: int = -1
     """max number of checkpoints to save, -1 means no limit"""
     save_model_only: bool = False
     """save model only, no optimizer state dict"""
     save_checkpoint_path: Optional[str] = None
     """save checkpoint path, if not specified, use `checkpoints/project_name/experiment_name`"""
+    rollout_log_path: Optional[str] = None
+    """JSONL path for semi-online rollout traces; defaults under save_checkpoint_path"""
     load_checkpoint_path: Optional[str] = None
     """load checkpoint path"""
     ray_timeline: Optional[str] = None
@@ -156,6 +166,9 @@ class TrainerConfig:
             self.save_checkpoint_path = os.path.join("checkpoints", self.project_name, self.experiment_name)
 
         self.save_checkpoint_path = os.path.abspath(self.save_checkpoint_path)  # may be not exist
+        if self.rollout_log_path is None:
+            self.rollout_log_path = os.path.join(self.save_checkpoint_path, "semi_online_rollouts.jsonl")
+        self.rollout_log_path = os.path.abspath(self.rollout_log_path)
         self.load_checkpoint_path = get_abs_path(self.load_checkpoint_path, prompt="Model checkpoint")
 
 
