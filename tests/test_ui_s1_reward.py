@@ -53,3 +53,28 @@ def test_android_control_long_press_time_matches_actual_sft_schema():
 <tool_call>{"name":"mobile_use","arguments":{"action":"long_press","coordinate":[100,200]}}</tool_call>"""
     ground_truth = '{"action":"long_press","coordinate":[100,200]}'
     assert score_one(response, ground_truth)["overall"] == 1.0
+
+
+def test_system_button_and_terminate_values_are_case_insensitive_but_enumerated():
+    button_response = """<thinking>Go back.</thinking>
+<tool_call>{"name":"mobile_use","arguments":{"action":"system_button","button":"back"}}</tool_call>"""
+    assert score_one(button_response, '{"action":"system_button","button":"Back"}')["overall"] == 1.0
+
+    terminate_response = """<thinking>The task cannot be completed.</thinking>
+<tool_call>{"name":"mobile_use","arguments":{"action":"terminate","status":"FAILURE"}}</tool_call>"""
+    assert score_one(terminate_response, '{"action":"terminate","status":"failure"}')["overall"] == 1.0
+
+    invalid_button = """<thinking>Use a system button.</thinking>
+<tool_call>{"name":"mobile_use","arguments":{"action":"system_button","button":"Menu"}}</tool_call>"""
+    assert score_one(invalid_button, '{"action":"system_button","button":"Back"}')["format"] == 0.0
+
+
+def test_wait_duration_is_validated_but_not_compared_and_swipe_matches_direction_only():
+    wait_response = """<thinking>Wait for the screen.</thinking>
+<tool_call>{"name":"mobile_use","arguments":{"action":"wait","time":0.1}}</tool_call>"""
+    assert score_one(wait_response, '{"action":"wait","time":10}')["overall"] == 1.0
+
+    swipe_response = """<thinking>Scroll upward.</thinking>
+<tool_call>{"name":"mobile_use","arguments":{"action":"swipe","coordinate":[10,2300],"coordinate2":[1000,100]}}</tool_call>"""
+    swipe_ground_truth = '{"action":"swipe","coordinate":[540,1800],"coordinate2":[540,600]}'
+    assert score_one(swipe_response, swipe_ground_truth)["overall"] == 1.0

@@ -1,6 +1,6 @@
 import torch
 
-from examples.ui_s1.advantage_ui_s1 import compute_ui_s1_advantages
+from examples.ui_s1.advantage_ui_s1 import compute_ui_s1_advantages, replace_nearest_rollout, rollout_score_std
 
 
 def test_ui_s1_advantages_use_full_episode_and_natural_step_segments():
@@ -57,3 +57,16 @@ def test_ui_s1_step_return_continues_between_two_patches():
 
     # Steps 1 and 2 are between two patches, so step 1 receives step 2's reward.
     assert torch.allclose(result.step_returns, torch.tensor([1.0, 3.5, 3.0, 4.0, 5.0]))
+
+
+def test_diversity_selection_replaces_only_a_near_mean_rollout():
+    selected_scores = [-0.8, -0.1, 0.0, 0.2]
+    replace, index, candidate_distance, nearest_distance = replace_nearest_rollout(selected_scores, 1.4)
+    assert replace
+    assert index == 3
+    assert candidate_distance > nearest_distance
+
+    replace, index, _, _ = replace_nearest_rollout(selected_scores, -0.13)
+    assert not replace
+    assert index == 1
+    assert rollout_score_std(selected_scores) > 0.0
