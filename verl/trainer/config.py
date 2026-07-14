@@ -96,6 +96,16 @@ class AlgorithmConfig:
     """enable UI-S1-style semi-online trajectory rollout"""
     patch_threshold: int = 0
     """number of expert-action patches allowed after action mismatch; -1 means unlimited"""
+    semi_online_gamma: float = 0.5
+    """discount factor for UI-S1 natural-segment step returns"""
+    semi_online_step_advantage_weight: float = 1.0
+    """weight of UI-S1 step-level advantage"""
+    semi_online_episode_advantage_weight: float = 1.0
+    """weight of UI-S1 episode-level advantage"""
+    semi_online_normalize_by_std: bool = True
+    """normalize UI-S1 advantages by rollout-group standard deviation"""
+    semi_online_advantage_std_threshold: float = 0.3
+    """minimum UI-S1 advantage standard deviation before accepting a rollout batch; 0 disables it"""
 
 
 @dataclass
