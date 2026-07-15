@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import os
 
 import ray
 from omegaconf import OmegaConf
@@ -36,14 +37,15 @@ class Runner:
         print(json.dumps(config.to_dict(), indent=2))
 
         # instantiate tokenizer
+        tokenizer_path = config.worker.actor.model.tokenizer_path or config.worker.actor.model.model_path
         tokenizer = get_tokenizer(
-            config.worker.actor.model.model_path,
+            tokenizer_path,
             override_chat_template=config.data.override_chat_template,
             trust_remote_code=config.worker.actor.model.trust_remote_code,
             use_fast=True,
         )
         processor = get_processor(
-            config.worker.actor.model.model_path,
+            tokenizer_path,
             override_chat_template=config.data.override_chat_template,
             trust_remote_code=config.worker.actor.model.trust_remote_code,
             use_fast=True,
@@ -112,7 +114,11 @@ def main():
                 "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
             }
         }
-        ray.init(runtime_env=runtime_env)
+        ray_init_kwargs = {"runtime_env": runtime_env}
+        dashboard_host = os.environ.get("RAY_DASHBOARD_HOST")
+        if dashboard_host:
+            ray_init_kwargs["dashboard_host"] = dashboard_host
+        ray.init(**ray_init_kwargs)
 
     runner = Runner.remote()
     ray.get(runner.run.remote(ppo_config))

@@ -68,6 +68,42 @@ from .sharding_manager import FSDPVLLMShardingManager
 from .sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 
+def _restore_qwen2_5_vl_rope_scaling(model_config) -> None:
+    """Restore the legacy Qwen2.5-VL RoPE field expected by this runtime.
+
+    Newer Transformers exports ``rope_parameters`` for Qwen2.5-VL, while the
+    Qwen attention implementation used by EasyR1 still reads
+    ``rope_scaling[\"mrope_section\"]``.  Keep this conversion in memory so the
+    exported Hugging Face checkpoint remains untouched.
+    """
+
+    text_config = getattr(model_config, "text_config", None)
+    for config in (model_config, text_config):
+        if config is None or getattr(config, "rope_scaling", None) is not None:
+            continue
+
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if not isinstance(rope_parameters, dict) or "mrope_section" not in rope_parameters:
+            continue
+
+        # Match the normalized structure produced when loading the original
+        # Qwen2.5-VL base checkpoint with this Transformers version.
+        config.rope_scaling = {
+            "type": "default",
+            "rope_type": "default",
+            "mrope_section": rope_parameters["mrope_section"],
+        }
+
+    # The language backbone owns RoPE, but keeping the outer config in sync
+    # also supports code paths that inspect the multimodal config directly.
+    if (
+        text_config is not None
+        and getattr(model_config, "rope_scaling", None) is None
+        and getattr(text_config, "rope_scaling", None) is not None
+    ):
+        model_config.rope_scaling = dict(text_config.rope_scaling)
+
+
 class FSDPWorker(Worker):
     def __init__(
         self,
@@ -183,6 +219,7 @@ class FSDPWorker(Worker):
                 pad_token_id=self.tokenizer.pad_token_id,
                 **model_config.override_config,
             )
+            _restore_qwen2_5_vl_rope_scaling(self.model_config)
 
             try:
                 self.generation_config = GenerationConfig.from_pretrained(model_config.model_path)
@@ -504,8 +541,14 @@ class FSDPWorker(Worker):
         if "multi_modal_data" not in data.non_tensor_batch:
             return
 
-        if "uid" in self._cache and not np.all(data.non_tensor_batch["uid"] == self._cache["uid"]):
-            self._cache.clear()
+        if "uid" in self._cache:
+            cached_uids = self._cache["uid"]
+            current_uids = data.non_tensor_batch["uid"]
+            # Actor-update padding can change the local batch length after
+            # log-prob computation. Clear and rebuild the multimodal cache
+            # before comparing values to avoid NumPy broadcasting errors.
+            if len(current_uids) != len(cached_uids) or not np.array_equal(current_uids, cached_uids):
+                self._cache.clear()
 
         if "multi_modal_inputs" not in self._cache:
             min_pixels = data.meta_info["min_pixels"]

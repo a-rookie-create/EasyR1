@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+from pathlib import Path
+import tempfile
 from contextlib import contextmanager
 from typing import Any, Optional, Union
 
@@ -49,6 +52,72 @@ def _get_logit_bias(processor: Optional[ProcessorMixin]) -> Optional[dict[int, f
         return {image_token_id: -100}
     else:
         return None
+
+
+def _get_model_architecture_override(model_path: str) -> Optional[dict[str, list[str]]]:
+    """Preserve the architecture declared by a local Hugging Face config.
+
+    Transformers 5.6 currently exposes ``Qwen2_5_VLConfig.architectures`` as
+    ``None`` even when the field is present in ``config.json``. vLLM uses that
+    runtime attribute to choose a model implementation, so pass the original
+    local value back through its supported ``hf_overrides`` interface.
+    """
+    config_path = Path(model_path) / "config.json"
+    if not config_path.is_file():
+        return None
+
+    try:
+        architectures = json.loads(config_path.read_text(encoding="utf-8")).get("architectures")
+    except (OSError, ValueError):
+        return None
+
+    if isinstance(architectures, list) and all(isinstance(item, str) for item in architectures):
+        return {"architectures": architectures}
+    return None
+
+
+def _create_vllm_model_view(model_path: str, tokenizer_path: Optional[str]) -> str:
+    """Build a lightweight local model view for vLLM's VLM processor.
+
+    vLLM 0.11 always loads a multimodal processor from ``model`` rather than
+    its separately configurable tokenizer path. LLaMA-Factory's merged export
+    has the fine-tuned weight shards but an old tokenizer-config schema that
+    Transformers 5.6 cannot read. The view links the merged weights and
+    replaces only the processor/tokenizer metadata with the original Qwen
+    files. No model weight is copied or modified.
+    """
+    model_dir = Path(model_path)
+    tokenizer_dir = Path(tokenizer_path) if tokenizer_path else None
+    if not model_dir.is_dir() or tokenizer_dir is None or not tokenizer_dir.is_dir():
+        return model_path
+
+    metadata_names = {
+        "config.json",
+        "generation_config.json",
+        "chat_template.json",
+        "chat_template.jinja",
+        "merges.txt",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    }
+    view_dir = Path(tempfile.mkdtemp(prefix="easyr1_vllm_model_"))
+    for source in model_dir.iterdir():
+        (view_dir / source.name).symlink_to(source, target_is_directory=source.is_dir())
+
+    for name in metadata_names:
+        source = tokenizer_dir / name
+        target = view_dir / name
+        if not source.exists():
+            continue
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(source, target_is_directory=source.is_dir())
+
+    return str(view_dir)
 
 
 def _process_multi_modal_data(
@@ -117,6 +186,17 @@ class vLLMRollout(BaseRollout):
         self.lora_kwargs = lora_kwargs
 
         engine_kwargs = {}
+        tokenizer_path = getattr(tokenizer, "name_or_path", None)
+        vllm_model_path = _create_vllm_model_view(model_path, tokenizer_path)
+        if isinstance(tokenizer_path, str) and tokenizer_path:
+            # The merged LLaMA-Factory export contains model weights, while
+            # its tokenizer_config uses an older extra_special_tokens schema.
+            # Keep vLLM's tokenizer and multimodal processor aligned with the
+            # explicit actor tokenizer. Model weights still come from model_path.
+            engine_kwargs["tokenizer"] = tokenizer_path
+            engine_kwargs["hf_config_path"] = tokenizer_path
+        if architecture_override := _get_model_architecture_override(model_path):
+            engine_kwargs["hf_overrides"] = architecture_override
         if processor is not None:  # only VLMs have processor
             engine_kwargs["disable_mm_preprocessor_cache"] = True
             if config.limit_images:
@@ -125,7 +205,7 @@ class vLLMRollout(BaseRollout):
         VLLMHijack.hijack()
 
         self.inference_engine = LLM(
-            model=model_path,
+            model=vllm_model_path,
             skip_tokenizer_init=False,
             trust_remote_code=config.trust_remote_code,
             load_format="dummy" if not self.lora_kwargs else "safetensors",
@@ -155,7 +235,12 @@ class vLLMRollout(BaseRollout):
         }
         default_sampling_params = SamplingParams()
         for key in config.to_dict().keys():
-            if hasattr(default_sampling_params, key):
+            # ``RolloutConfig.seed`` seeds the vLLM engine. Passing that same
+            # seed to every SamplingParams request restarts the RNG for each
+            # sequential UI-S1 rollout, so identical prompts produce
+            # identical candidates. Leave the request seed unset and let the
+            # engine advance its reproducible RNG state across requests.
+            if key != "seed" and hasattr(default_sampling_params, key):
                 sampling_kwargs[key] = getattr(config, key)
 
         print(f"Sampling params: {sampling_kwargs}.")

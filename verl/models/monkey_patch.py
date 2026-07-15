@@ -29,11 +29,14 @@ SUPPORTED_MODEL_TYPE = (
     "qwen3_moe",
     "qwen2_vl",
     "qwen2_5_vl",
+    "qwen2_5_vl_text",
     "qwen3_vl",
     "qwen3_vl_moe",
 )
 
-QWEN2_VL_MODELS = ("qwen2_vl", "qwen2_5_vl")
+# Transformers 4.57 exposes Qwen2.5-VLConfig.model_type as the internal
+# text-backbone name even though the config class remains multimodal.
+QWEN2_VL_MODELS = ("qwen2_vl", "qwen2_5_vl", "qwen2_5_vl_text")
 QWEN3_VL_MODELS = ("qwen3_vl", "qwen3_vl_moe")
 
 

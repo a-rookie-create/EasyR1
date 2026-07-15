@@ -353,28 +353,80 @@ class RayPPOTrainer:
         )
         return by_step or by_epoch
 
-    def _write_semi_online_rollout_logs(
-        self, records: list[dict[str, Any]], candidate_attempt: int, accepted_for_update: bool, advantage_std: float
-    ) -> None:
-        if not records:
+    def _append_semi_online_rollout_log_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Append visible JSONL records while semi-online generation is still running."""
+        if not entries:
             return
         log_path = self.config.trainer.rollout_log_path
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(
-                    json.dumps(
-                        {
-                            "global_step": self.global_step,
-                            "candidate_attempt": candidate_attempt,
-                            "accepted_for_update": accepted_for_update,
-                            "advantage_std": advantage_std,
-                            **record,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+            for entry in entries:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # Keep the records observable by `tail -f` without waiting for a
+            # training step or the Python process to exit.
+            handle.flush()
+
+    def _write_semi_online_rollout_logs(
+        self, records: list[dict[str, Any]], candidate_attempt: int, advantage_std: float
+    ) -> None:
+        self._append_semi_online_rollout_log_entries(
+            [
+                {
+                    "record_type": "rollout",
+                    "global_step": self.global_step,
+                    "candidate_attempt": candidate_attempt,
+                    "selected_batch": True,
+                    "advantage_std": advantage_std,
+                    **record,
+                }
+                for record in records
+            ]
+        )
+
+    def _write_semi_online_rollout_progress(self, states: list[dict[str, Any]]) -> None:
+        """Log completed candidate rollouts before diversity selection is known."""
+        entries = []
+        for state in states:
+            termination_reason = (
+                "expert_trajectory_exhausted"
+                if state["step_pos"] >= len(state["steps"])
+                else "patch_threshold_exhausted"
+            )
+            entries.append(
+                {
+                    "record_type": "rollout_progress",
+                    "global_step": self.global_step,
+                    "task_id": state["task_id"],
+                    "trajectory_id": state["traj_uid"],
+                    "rollout_id": state["rollout_id"],
+                    "goal": state["goal"],
+                    "expert_step_count": len(state["steps"]),
+                    "generated_step_count": len(state["events"]),
+                    "patch_count": state["patch_count"],
+                    "patch_threshold": self.config.algorithm.patch_threshold,
+                    "episode_return": sum(float(event["reward"].get("overall", 0.0)) for event in state["events"]),
+                    "selection_status": "pending",
+                    "reached_trajectory_end": state["step_pos"] >= len(state["steps"]),
+                    "termination_reason": termination_reason,
+                    "events": state["events"],
+                }
+            )
+        self._append_semi_online_rollout_log_entries(entries)
+
+    def _write_semi_online_update_result(self, records: list[dict[str, Any]]) -> None:
+        """Append one explicit confirmation after a selected batch updates the actor."""
+        if not records:
+            return
+        self._append_semi_online_rollout_log_entries(
+            [
+                {
+                    "record_type": "actor_update",
+                    "global_step": self.global_step,
+                    "update_completed": True,
+                    "trajectory_ids": [record["trajectory_id"] for record in records],
+                }
+            ]
+        )
 
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
@@ -749,6 +801,7 @@ class RayPPOTrainer:
                     "patch_count": 0,
                     "finished": False,
                     "events": [],
+                    "progress_logged": False,
                     "selected_for_update": True,
                     "selection_reason": "initial_rollout_retained",
                 }
@@ -863,6 +916,7 @@ class RayPPOTrainer:
                         "patch_count": 0,
                         "finished": False,
                         "events": [],
+                        "progress_logged": False,
                         "selected_for_update": False,
                         "selection_reason": "pending_diversity_candidate",
                     }
@@ -968,6 +1022,15 @@ class RayPPOTrainer:
 
                 step_batch.non_tensor_batch["extract_match"] = np.array(extract_match, dtype=object)
                 step_batches.append(step_batch)
+
+                completed_states = []
+                for example in examples:
+                    state = states[example["state_idx"]]
+                    rollout_complete = state["finished"] or state["step_pos"] >= len(state["steps"])
+                    if rollout_complete and not state["progress_logged"]:
+                        state["progress_logged"] = True
+                        completed_states.append(state)
+                self._write_semi_online_rollout_progress(completed_states)
 
         if not step_batches:
             raise RuntimeError("Semi-online rollout produced no training samples.")
@@ -1171,7 +1234,7 @@ class RayPPOTrainer:
                         ui_s1_metrics = batch.meta_info.get("ui_s1_metrics", {})
                         advantage_std = float(ui_s1_metrics.get("uis1/advantage_std", 0.0))
                         self._write_semi_online_rollout_logs(
-                            self._semi_online_rollout_records, 1, True, advantage_std
+                            self._semi_online_rollout_records, 1, advantage_std
                         )
                         metrics.update(candidate_metrics)
                         metrics.update(ui_s1_metrics)
@@ -1246,10 +1309,25 @@ class RayPPOTrainer:
                 # update actor
                 if self.config.trainer.critic_warmup <= self.global_step:
                     with timer("update_actor", timing_raw):
-                        actor_output = self.actor_rollout_ref_wg.update_actor(batch)
+                        actor_batch = batch
+                        if self.config.algorithm.semi_online:
+                            # UI-S1's reference trainer pads variable-length
+                            # multi-turn step batches before the PPO update.
+                            # The final rollout selection and advantages have
+                            # already been computed on the unpadded batch.
+                            actor_update_divisor = (
+                                self.config.worker.actor.global_batch_size * self.config.worker.rollout.n
+                            )
+                            actor_batch, actor_padding_size = pad_dataproto_to_divisor(
+                                batch, actor_update_divisor
+                            )
+                            metrics["uis1/actor_update_padding"] = float(actor_padding_size)
+                        actor_output = self.actor_rollout_ref_wg.update_actor(actor_batch)
 
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
+                    if self.config.algorithm.semi_online:
+                        self._write_semi_online_update_result(self._semi_online_rollout_records)
 
                 # validate
                 if (

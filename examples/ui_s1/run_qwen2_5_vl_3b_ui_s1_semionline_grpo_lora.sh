@@ -35,9 +35,9 @@ MAX_ROLLOUTS_PER_TASK=${MAX_ROLLOUTS_PER_TASK:-20}
 HISTORY_IMAGE_LIMIT=${HISTORY_IMAGE_LIMIT:-2}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-12288}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
-# Qwen2.5-VL image preprocessing cap. Keep the current 4 MP default unless a
-# single unusually large screenshot is the source of an OOM.
-MAX_IMAGE_PIXELS=${MAX_IMAGE_PIXELS:-4194304}
+# A 2 MP cap keeps a two-image UI step within two 24 GB cards' backward-pass
+# budget. AndroidControl also contains 1440 x 3120 screenshots (4.49 MP).
+MAX_IMAGE_PIXELS=${MAX_IMAGE_PIXELS:-2097152}
 # 2 x RTX 3090: FSDP shards are larger than in the three-GPU run.
 VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.62}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-12800}
@@ -68,6 +68,9 @@ set -x
 
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 export RAY_DASHBOARD_HOST=${RAY_DASHBOARD_HOST:-0.0.0.0}
+# Avoid allocator fragmentation when UI steps have substantially different
+# image resolutions and therefore different activation sizes.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 IFS=',' read -ra GPU_ID_ARRAY <<< "${GPU_IDS}"
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-${#GPU_ID_ARRAY[@]}}
 
