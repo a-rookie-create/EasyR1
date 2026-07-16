@@ -5,6 +5,8 @@ Each output row contains one complete trajectory.  The semi-online trainer owns
 the rollout history and reads ``trajectory_steps`` during training.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import random
@@ -207,7 +209,12 @@ def convert_amex_dir(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--amex-dir", type=Path, default=Path("/home/zst/biye215/datasets/amex"))
+    parser.add_argument(
+        "--amex-dir",
+        type=Path,
+        required=True,
+        help="Directory containing the source AMEX dataset.",
+    )
     parser.add_argument(
         "--train-ratio", type=float, default=0.8, help="AMEX trajectory-level train split ratio."
     )
@@ -215,7 +222,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Deterministic episode-level AMEX split seed.")
     parser.add_argument(
         "--output-dir",
-        default="/home/zst/biye215/EasyR1/datasets/ui_s1_amex_rl",
+        type=Path,
+        required=True,
         help="Output directory for AMEX trajectory-level JSONL files.",
     )
     parser.add_argument(
@@ -230,10 +238,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
     train_count, val_count, test_count = convert_amex_dir(
         args.amex_dir,
-        output_dir,
+        args.output_dir,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         seed=args.seed,

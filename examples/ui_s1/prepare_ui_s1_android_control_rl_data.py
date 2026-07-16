@@ -222,9 +222,14 @@ def build_trajectory(episode: dict[str, Any], image_dir: Path) -> tuple[dict[str
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--android-control-dir", type=Path, default=Path("/home/zst/biye215/datasets/android_control"))
-    parser.add_argument("--image-dir", type=Path, default=Path("/home/zst/biye215/llamafactory/data/ui_s1_android_control_sft/images"))
-    parser.add_argument("--output-dir", type=Path, default=Path("/home/zst/biye215/EasyR1/datasets/ui_s1_android_control_rl"))
+    parser.add_argument(
+        "--android-control-dir",
+        type=Path,
+        required=True,
+        help="Directory containing AndroidControl episodes.",
+    )
+    parser.add_argument("--image-dir", type=Path, required=True, help="Directory containing prepared training images.")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for trajectory JSONL files.")
     parser.add_argument("--limit-episodes", type=int, default=None, help="Optional limit per split for a smoke conversion.")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing generated JSONL files.")
     args = parser.parse_args()

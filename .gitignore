@@ -186,6 +186,9 @@ images*
 # Generated UI-S1 trajectory data and image links.
 /datasets/
 
+# Machine-specific UI-S1 paths and hardware settings.
+/examples/ui_s1/runtime.env
+
 # Formal RL run artifacts are generated under per-run directories.
 /output/*
 /output/**

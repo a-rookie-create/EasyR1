@@ -1,55 +1,57 @@
 #!/bin/bash
 
 # Source-agnostic formal UI-S1 semi-online GRPO LoRA runner.
-# Select AndroidControl or AMEX through DATA_DIR.
+# Select AndroidControl or AMEX through DATASET.
 set -euo pipefail
 shopt -s nullglob
 
-MODEL_PATH=${MODEL_PATH:-/home/zst/biye215/llamafactory/output/ui_s1_qwen25vl_3b_android_control_amex_lora_full_3gpu_merged}
-TOKENIZER_PATH=${TOKENIZER_PATH:-/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct}
-DATA_DIR=${DATA_DIR:-/home/zst/biye215/EasyR1/datasets/ui_s1_android_control_rl}
-OUTPUT_ROOT=${OUTPUT_ROOT:-/home/zst/biye215/EasyR1/output}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+EASYR1_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
+RUNTIME_ENV=${RUNTIME_ENV:-${SCRIPT_DIR}/runtime.env}
+TRAIN_ENV=${TRAIN_ENV:-${SCRIPT_DIR}/train.env}
+
+for env_file in "${RUNTIME_ENV}" "${TRAIN_ENV}"; do
+    if [[ ! -r "${env_file}" ]]; then
+        echo "Missing configuration file: ${env_file}" >&2
+        echo "Copy runtime.env.example to runtime.env and set this server's paths and GPUs." >&2
+        exit 2
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    source "${env_file}"
+    set +a
+done
+
+case "${DATASET}" in
+    android_control)
+        DATA_DIR=${DATA_DIR:-${ANDROID_CONTROL_OUTPUT_DIR:?Set ANDROID_CONTROL_OUTPUT_DIR in runtime.env}}
+        ;;
+    amex)
+        DATA_DIR=${DATA_DIR:-${AMEX_OUTPUT_DIR:?Set AMEX_OUTPUT_DIR in runtime.env}}
+        ;;
+    *) echo "Unsupported DATASET=${DATASET}; expected android_control or amex" >&2; exit 2 ;;
+esac
+
+required_runtime_vars=(
+    MODEL_PATH
+    TOKENIZER_PATH
+    DATA_DIR
+    OUTPUT_ROOT
+    GPU_IDS
+    RAY_DASHBOARD_HOST
+    VLLM_GPU_MEMORY_UTILIZATION
+    PYTORCH_CUDA_ALLOC_CONF
+)
+for required_var in "${required_runtime_vars[@]}"; do
+    if [[ -z "${!required_var:-}" ]]; then
+        echo "Missing required runtime setting: ${required_var}" >&2
+        exit 2
+    fi
+done
+
 DATASET_LABEL=${DATASET_LABEL:-$(basename "${DATA_DIR}")}
 RUN_NAME=${RUN_NAME:-ui_s1_qwen25vl_3b_${DATASET_LABEL}_semionline_grpo_lora_$(date +%Y%m%d_%H%M%S)}
 RUN_DIR=${OUTPUT_ROOT}/${RUN_NAME}
-# GPU 1 is currently occupied by another workload. This remains overridable.
-GPU_IDS=${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-0,2}}
-
-# Paper-aligned values are retained where the two available 24 GB GPUs permit them.
-EPOCHS=${EPOCHS:-5}
-# Optional smoke-test cap. Leave unset for the formal five-epoch run.
-MAX_STEPS=${MAX_STEPS:-}
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-3}
-ACTOR_GLOBAL_BATCH_SIZE=${ACTOR_GLOBAL_BATCH_SIZE:-3}
-ROLLOUT_N=${ROLLOUT_N:-8}
-# Keep one UI trajectory step per backward pass on two 24 GB cards. Dynamic
-# token batching can otherwise combine several shorter multimodal steps.
-ACTOR_DYNAMIC_BATCHING=${ACTOR_DYNAMIC_BATCHING:-false}
-ACTOR_USE_TORCH_COMPILE=${ACTOR_USE_TORCH_COMPILE:-false}
-# `Compute log probs` is also constrained to one multimodal UI step per
-# device. The reference worker inherits this value from the actor config.
-EXPERIENCE_MICRO_BATCH_SIZE=${EXPERIENCE_MICRO_BATCH_SIZE:-1}
-# Generate one task group at a time on the two-card setup; ROLLOUT_N stays 8.
-GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE:-1}
-MAX_ROLLOUTS_PER_TASK=${MAX_ROLLOUTS_PER_TASK:-20}
-HISTORY_IMAGE_LIMIT=${HISTORY_IMAGE_LIMIT:-2}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-12288}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-512}
-# A 2 MP cap keeps a two-image UI step within two 24 GB cards' backward-pass
-# budget. AndroidControl also contains 1440 x 3120 screenshots (4.49 MP).
-MAX_IMAGE_PIXELS=${MAX_IMAGE_PIXELS:-2097152}
-# 2 x RTX 3090: FSDP shards are larger than in the three-GPU run.
-VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.62}
-VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-12800}
-VLLM_MAX_NUM_BATCHED_TOKENS=${VLLM_MAX_NUM_BATCHED_TOKENS:-24576}
-# vLLM supports LoRA updates for the language model, not Qwen2.5-VL's visual tower.
-LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}
-PATCH_THRESHOLD=${PATCH_THRESHOLD:-1}
-UIS1_GAMMA=${UIS1_GAMMA:-0.5}
-UIS1_STEP_ADVANTAGE_WEIGHT=${UIS1_STEP_ADVANTAGE_WEIGHT:-1.0}
-UIS1_EPISODE_ADVANTAGE_WEIGHT=${UIS1_EPISODE_ADVANTAGE_WEIGHT:-1.0}
-UIS1_ADVANTAGE_STD_THRESHOLD=${UIS1_ADVANTAGE_STD_THRESHOLD:-0.3}
-SAVE_EVERY_N_EPOCHS=${SAVE_EVERY_N_EPOCHS:-1}
 
 TRAINER_MAX_STEPS_ARG=()
 if [[ -n "${MAX_STEPS}" ]]; then
@@ -67,14 +69,14 @@ exec > >(tee -a "${RUN_LOG}") 2>&1
 set -x
 
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
-export RAY_DASHBOARD_HOST=${RAY_DASHBOARD_HOST:-0.0.0.0}
+export RAY_DASHBOARD_HOST
 # Avoid allocator fragmentation when UI steps have substantially different
 # image resolutions and therefore different activation sizes.
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+export PYTORCH_CUDA_ALLOC_CONF
 IFS=',' read -ra GPU_ID_ARRAY <<< "${GPU_IDS}"
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-${#GPU_ID_ARRAY[@]}}
 
-cd /home/zst/biye215/EasyR1
+cd "${EASYR1_ROOT}"
 
 if [[ -z "${TRAIN_FILE:-}" ]]; then
     train_candidates=("${DATA_DIR}"/*_train.jsonl)
