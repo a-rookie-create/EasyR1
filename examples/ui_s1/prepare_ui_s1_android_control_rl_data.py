@@ -181,18 +181,6 @@ def load_official_splits(data_dir: Path) -> dict[str, set[int]]:
     return {name: {int(episode_id) for episode_id in ids} for name, ids in raw.items()}
 
 
-def ensure_image_link(output_dir: Path, source_dir: Path) -> Path:
-    if not source_dir.is_dir():
-        raise FileNotFoundError(f"Extracted AndroidControl image directory not found: {source_dir}")
-    image_link = output_dir / "images"
-    if image_link.exists() or image_link.is_symlink():
-        if not image_link.is_symlink() or image_link.resolve() != source_dir.resolve():
-            raise FileExistsError(f"Image link already exists with a different target: {image_link}")
-        return image_link
-    image_link.symlink_to(source_dir, target_is_directory=True)
-    return image_link
-
-
 def build_trajectory(episode: dict[str, Any], image_dir: Path) -> tuple[dict[str, Any] | None, Counter[str]]:
     steps = []
     action_counts: Counter[str] = Counter()
@@ -249,7 +237,8 @@ def main() -> None:
     output_paths.append(args.output_dir / "ui_s1_android_control_rl_test.jsonl")
     if not args.overwrite and any(path.exists() for path in output_paths):
         raise FileExistsError(f"Output already exists in {args.output_dir}; pass --overwrite to replace it")
-    output_image_dir = ensure_image_link(args.output_dir, args.image_dir)
+    if not args.image_dir.is_dir():
+        raise FileNotFoundError(f"Extracted AndroidControl image directory not found: {args.image_dir}")
     try:
         for split in target_splits:
             name = "val" if split == "validation" else split
@@ -258,7 +247,7 @@ def main() -> None:
             split = next((name for name in target_splits if episode["episode_id"] in official_splits.get(name, set())), None)
             if split is None or (args.limit_episodes is not None and counts[split] >= args.limit_episodes):
                 continue
-            trajectory, episode_actions = build_trajectory(episode, output_image_dir)
+            trajectory, episode_actions = build_trajectory(episode, args.image_dir)
             if trajectory is None:
                 skipped_empty_episodes[split] += 1
                 continue
@@ -277,7 +266,7 @@ def main() -> None:
         "skipped_empty_action_episodes": dict(skipped_empty_episodes),
         "action_counts": dict(sorted(action_counts.items())),
         "source_image_dir": str(args.image_dir),
-        "image_link": str(output_image_dir),
+        "image_path_mode": "direct",
         "limit_episodes": args.limit_episodes,
     }
     (args.output_dir / "conversion_stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

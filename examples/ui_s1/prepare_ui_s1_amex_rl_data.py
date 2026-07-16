@@ -96,21 +96,7 @@ def split_trajectories(
     }
 
 
-def ensure_image_link(output_dir: Path, source_dir: Path) -> Path:
-    if not source_dir.is_dir():
-        raise FileNotFoundError(f"AMEX screenshot directory not found: {source_dir}")
-    image_link = output_dir / "images"
-    if image_link.exists() or image_link.is_symlink():
-        if not image_link.is_symlink() or image_link.resolve() != source_dir.resolve():
-            raise FileExistsError(f"Image link already exists with a different target: {image_link}")
-        return image_link
-    image_link.symlink_to(source_dir, target_is_directory=True)
-    return image_link
-
-
-def build_amex_trajectory(
-    instruction_path: Path, source_screenshot_dir: Path, output_screenshot_dir: Path
-) -> dict[str, Any] | None:
+def build_amex_trajectory(instruction_path: Path, source_screenshot_dir: Path) -> dict[str, Any] | None:
     with instruction_path.open("r", encoding="utf-8") as f:
         item = json.load(f)
 
@@ -127,7 +113,7 @@ def build_amex_trajectory(
         steps.append(
             {
                 "step_id": raw_step.get("step_id"),
-                "image": str(output_screenshot_dir / image_name),
+                "image": str(source_image_path),
                 "action": action,
             }
         )
@@ -165,7 +151,8 @@ def convert_amex_dir(
     if not overwrite and any(path.exists() for path in output_paths):
         raise FileExistsError(f"Output already exists in {output_dir}; pass --overwrite to replace it")
     source_screenshot_dir = amex_dir / "screenshot" / "screenshot"
-    output_screenshot_dir = ensure_image_link(output_dir, source_screenshot_dir)
+    if not source_screenshot_dir.is_dir():
+        raise FileNotFoundError(f"AMEX screenshot directory not found: {source_screenshot_dir}")
     instruction_paths = amex_instruction_paths(amex_dir)
     split_paths = split_trajectories(instruction_paths, train_ratio, val_ratio, seed)
     train_paths = split_paths["train"]
@@ -181,7 +168,7 @@ def convert_amex_dir(
         count = 0
         with output_path.open("w", encoding="utf-8") as f:
             for instruction_path in paths:
-                example = build_amex_trajectory(instruction_path, source_screenshot_dir, output_screenshot_dir)
+                example = build_amex_trajectory(instruction_path, source_screenshot_dir)
                 if example is None:
                     continue
                 f.write(json.dumps(example, ensure_ascii=False) + "\n")
@@ -199,7 +186,7 @@ def convert_amex_dir(
         "episode_counts": {"train": counts[0], "val": counts[1], "test": counts[2]},
         "action_counts": dict(sorted(action_counts.items())),
         "source_screenshot_dir": str(source_screenshot_dir),
-        "image_link": str(output_screenshot_dir),
+        "image_path_mode": "direct",
     }
     (output_dir / "conversion_stats.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
