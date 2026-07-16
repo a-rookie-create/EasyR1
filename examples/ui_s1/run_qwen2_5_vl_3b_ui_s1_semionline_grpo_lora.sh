@@ -49,7 +49,7 @@ for required_var in "${required_runtime_vars[@]}"; do
     fi
 done
 
-DATASET_LABEL=${DATASET_LABEL:-$(basename "${DATA_DIR}")}
+DATASET_LABEL=${DATASET_LABEL:-${DATASET}}
 RUN_NAME=${RUN_NAME:-ui_s1_qwen25vl_3b_${DATASET_LABEL}_semionline_grpo_lora_$(date +%Y%m%d_%H%M%S)}
 RUN_DIR=${OUTPUT_ROOT}/${RUN_NAME}
 

@@ -226,6 +226,13 @@ class vLLMRollout(BaseRollout):
         )
 
         # Offload vllm model to reduce peak memory usage
+        # CUDA graph capture can still have asynchronous work in flight here.
+        # Sleeping the CuMem allocator immediately races that work on some
+        # driver/runtime combinations and surfaces as CUDA_ERROR_INVALID_VALUE
+        # while vLLM allocates its pinned CPU backup. Synchronize only at this
+        # initialization boundary instead of globally enabling
+        # CUDA_LAUNCH_BLOCKING, which would slow the whole training run.
+        torch.cuda.synchronize()
         self.inference_engine.sleep(level=1)
 
         sampling_kwargs = {

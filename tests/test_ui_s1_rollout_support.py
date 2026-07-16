@@ -25,11 +25,11 @@ def test_epoch_checkpoint_cadence_and_rollout_trace(tmp_path):
     trainer._write_semi_online_rollout_logs(
         [{"task_id": "task-1", "events": [{"step_id": 0, "patch_applied": True}]}],
         candidate_attempt=2,
-        accepted_for_update=False,
         advantage_std=0.1,
     )
     record = json.loads((tmp_path / "rollouts.jsonl").read_text(encoding="utf-8"))
+    assert record["record_type"] == "rollout"
     assert record["global_step"] == 5
     assert record["candidate_attempt"] == 2
-    assert not record["accepted_for_update"]
+    assert record["selected_batch"]
     assert record["events"][0]["patch_applied"]
