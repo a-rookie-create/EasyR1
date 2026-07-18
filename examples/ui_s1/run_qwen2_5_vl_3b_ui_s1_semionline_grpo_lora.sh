@@ -137,6 +137,7 @@ python3 -m verl.trainer.main \
     worker.rollout.limit_images=${HISTORY_IMAGE_LIMIT} \
     worker.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION} \
     worker.rollout.tensor_parallel_size=1 \
+    worker.rollout.enforce_eager=${VLLM_ENFORCE_EAGER:-false} \
     worker.rollout.max_model_len=${VLLM_MAX_MODEL_LEN} \
     worker.rollout.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS} \
     worker.reward.reward_function=examples/ui_s1/reward_ui_s1_step.py:compute_score \
