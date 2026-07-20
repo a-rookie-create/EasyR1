@@ -14,6 +14,7 @@
 
 
 from .logger import Tracker
+from .progress_logger import TrainingProgressLogger
 
 
-__all__ = ["Tracker"]
+__all__ = ["Tracker", "TrainingProgressLogger"]

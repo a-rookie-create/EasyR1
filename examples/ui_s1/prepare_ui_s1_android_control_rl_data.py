@@ -153,8 +153,8 @@ def build_first_step_prompt(goal: str) -> str:
         "<image>\n"
         f"Goal: {goal.strip()}\n\n"
         "Previous model outputs:\nNone\n\n"
-        "Predict the next Android GUI action. Return <thinking></thinking> followed by a "
-        "<tool_call> containing {\"name\":\"mobile_use\",\"arguments\":{...}}."
+        "Predict the next Android GUI action. Return <thinking></thinking> followed by "
+        "{\"name\":\"mobile_use\",\"arguments\":{...}}."
     )
 
 

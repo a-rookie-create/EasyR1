@@ -154,6 +154,8 @@ class TrainerConfig:
     """save checkpoint path, if not specified, use `checkpoints/project_name/experiment_name`"""
     rollout_log_path: Optional[str] = None
     """JSONL path for semi-online rollout traces; defaults under save_checkpoint_path"""
+    progress_log_path: Optional[str] = None
+    """human-readable, line-buffered training progress log; defaults under save_checkpoint_path"""
     load_checkpoint_path: Optional[str] = None
     """load checkpoint path"""
     ray_timeline: Optional[str] = None
@@ -169,6 +171,9 @@ class TrainerConfig:
         if self.rollout_log_path is None:
             self.rollout_log_path = os.path.join(self.save_checkpoint_path, "semi_online_rollouts.jsonl")
         self.rollout_log_path = os.path.abspath(self.rollout_log_path)
+        if self.progress_log_path is None:
+            self.progress_log_path = os.path.join(self.save_checkpoint_path, "training_progress.log")
+        self.progress_log_path = os.path.abspath(self.progress_log_path)
         self.load_checkpoint_path = get_abs_path(self.load_checkpoint_path, prompt="Model checkpoint")
 
 

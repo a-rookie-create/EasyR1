@@ -1,7 +1,7 @@
 from examples.ui_s1.reward_ui_s1_step import score_one
 
 
-def test_ui_s1_reward_requires_thinking_tool_call_and_mobile_use_schema():
+def test_ui_s1_reward_accepts_tagged_and_sft_direct_mobile_use_formats():
     response = """<thinking>
 Open the target application.
 </thinking>
@@ -11,7 +11,11 @@ Open the target application.
     ground_truth = '{"action":"open","text":"Calendar"}'
     assert score_one(response, ground_truth)["overall"] == 1.0
 
-    missing_thinking = '<tool_call>\n{"name":"mobile_use","arguments":{"action":"open","text":"Calendar"}}\n</tool_call>'
+    direct_response = """<thinking>Open the target application.</thinking>
+- {"name":"mobile_use","arguments":{"action":"open","text":"Calendar"}}"""
+    assert score_one(direct_response, ground_truth)["overall"] == 1.0
+
+    missing_thinking = '{"name":"mobile_use","arguments":{"action":"open","text":"Calendar"}}'
     assert score_one(missing_thinking, ground_truth)["format"] == 0.0
 
     invalid_status = """<thinking>x</thinking>

@@ -14,12 +14,14 @@
 
 import json
 import os
+import time
 
 import ray
 from omegaconf import OmegaConf
 
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
+from ..utils.logger import TrainingProgressLogger
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import AutoRewardManager
 from .config import PPOConfig
@@ -35,8 +37,18 @@ class Runner:
     def run(self, config: PPOConfig):
         # print config
         print(json.dumps(config.to_dict(), indent=2))
+        progress_logger = TrainingProgressLogger(config.trainer.progress_log_path)
+        progress_logger.log(
+            "RUN",
+            "START",
+            experiment=config.trainer.experiment_name,
+            gpus_per_node=config.trainer.n_gpus_per_node,
+            nodes=config.trainer.nnodes,
+        )
 
         # instantiate tokenizer
+        setup_started = time.perf_counter()
+        progress_logger.log("MODEL_PROCESSOR", "START")
         tokenizer_path = config.worker.actor.model.tokenizer_path or config.worker.actor.model.model_path
         tokenizer = get_tokenizer(
             tokenizer_path,
@@ -50,6 +62,7 @@ class Runner:
             trust_remote_code=config.worker.actor.model.trust_remote_code,
             use_fast=True,
         )
+        progress_logger.log("MODEL_PROCESSOR", "END", elapsed_s=time.perf_counter() - setup_started)
 
         # define worker classes
         ray_worker_group_cls = RayWorkerGroup
@@ -71,7 +84,12 @@ class Runner:
         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
 
+        data_started = time.perf_counter()
+        progress_logger.log("DATASET", "START", train_files=config.data.train_files, val_files=config.data.val_files)
         train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
+        progress_logger.log(
+            "DATASET", "END", elapsed_s=time.perf_counter() - data_started, train_batches=len(train_dataloader), val_batches=len(val_dataloader)
+        )
 
         trainer = RayPPOTrainer(
             config=config,
@@ -84,8 +102,12 @@ class Runner:
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
+            progress_logger=progress_logger,
         )
+        workers_started = time.perf_counter()
+        progress_logger.log("WORKERS", "START", roles="actor_rollout_ref,reward")
         trainer.init_workers()
+        progress_logger.log("WORKERS", "END", elapsed_s=time.perf_counter() - workers_started)
         trainer.fit()
 
 

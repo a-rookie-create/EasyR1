@@ -76,6 +76,45 @@ export PYTORCH_CUDA_ALLOC_CONF
 IFS=',' read -ra GPU_ID_ARRAY <<< "${GPU_IDS}"
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-${#GPU_ID_ARRAY[@]}}
 
+is_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_nonnegative_integer() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+is_positive_integer "${N_GPUS_PER_NODE}" || {
+    echo "N_GPUS_PER_NODE must be a positive integer, got ${N_GPUS_PER_NODE}." >&2
+    exit 2
+}
+is_positive_integer "${ROLLOUT_N}" || {
+    echo "ROLLOUT_N must be a positive integer, got ${ROLLOUT_N}." >&2
+    exit 2
+}
+is_positive_integer "${MAX_ROLLOUTS_PER_TASK}" || {
+    echo "MAX_ROLLOUTS_PER_TASK must be a positive integer, got ${MAX_ROLLOUTS_PER_TASK}." >&2
+    exit 2
+}
+if (( MAX_ROLLOUTS_PER_TASK < ROLLOUT_N )); then
+    echo "MAX_ROLLOUTS_PER_TASK (${MAX_ROLLOUTS_PER_TASK}) must be at least ROLLOUT_N (${ROLLOUT_N})." >&2
+    exit 2
+fi
+
+# A one-request micro batch causes the semi-online driver to make one vLLM
+# call per trajectory. train.env records the four-GPU default; this fallback
+# only applies when a custom TRAIN_ENV leaves the value empty.
+GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE:-${N_GPUS_PER_NODE}}
+is_nonnegative_integer "${GENERATION_MICRO_BATCH_SIZE}" || {
+    echo "GENERATION_MICRO_BATCH_SIZE must be a non-negative integer, got ${GENERATION_MICRO_BATCH_SIZE}." >&2
+    exit 2
+}
+if (( GENERATION_MICRO_BATCH_SIZE > 0 && GENERATION_MICRO_BATCH_SIZE < N_GPUS_PER_NODE )); then
+    echo "WARNING: GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE} is below the ${N_GPUS_PER_NODE} visible GPUs; padded duplicate requests cannot increase useful rollout concurrency." >&2
+fi
+
+echo "UI-S1 effective rollout configuration: tasks_per_update=${ROLLOUT_BATCH_SIZE}, selected_rollouts_per_task=${ROLLOUT_N}, max_candidates_per_task=${MAX_ROLLOUTS_PER_TASK}, generation_micro_batch=${GENERATION_MICRO_BATCH_SIZE}, visible_gpus=${N_GPUS_PER_NODE}."
+
 cd "${EASYR1_ROOT}"
 
 if [[ -z "${TRAIN_FILE:-}" ]]; then
@@ -156,4 +195,5 @@ python3 -m verl.trainer.main \
     trainer.save_model_only=false \
     trainer.save_checkpoint_path=${RUN_DIR} \
     trainer.rollout_log_path=${RUN_DIR}/semi_online_rollouts.jsonl \
+    trainer.progress_log_path=${RUN_DIR}/training_progress.log \
     trainer.find_last_checkpoint=false

@@ -29,6 +29,15 @@ MODEL_RESPONSE_PATTERN = re.compile(
     r"<tool_call>\s*(?P<tool_call>\{.*\})\s*</tool_call>\s*",
     flags=re.DOTALL,
 )
+# The UI-S1 SFT model currently emits a mobile_use JSON object directly after
+# its thinking block (often with a list-marker dash). Accept that canonical
+# model format as well as the tagged format above, but still require a single
+# valid mobile_use object and no trailing prose.
+DIRECT_MODEL_RESPONSE_PATTERN = re.compile(
+    r"\s*<thinking>(?P<thinking>.*?)</thinking>\s*(?:-\s*)?"
+    r"(?P<tool_call>\{.*\})\s*",
+    flags=re.DOTALL,
+)
 
 def normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
@@ -91,10 +100,11 @@ def parse_action(text: Any, require_tool_call: bool = False) -> tuple[dict[str, 
     if not raw:
         return None, 0.0
 
-    response_match = MODEL_RESPONSE_PATTERN.fullmatch(raw)
     candidates = []
-    if response_match and response_match.group("thinking").strip():
-        candidates.append((response_match.group("tool_call"), 1.0, True))
+    for response_pattern in (MODEL_RESPONSE_PATTERN, DIRECT_MODEL_RESPONSE_PATTERN):
+        response_match = response_pattern.fullmatch(raw)
+        if response_match and response_match.group("thinking").strip():
+            candidates.append((response_match.group("tool_call"), 1.0, True))
     if not require_tool_call:
         candidates.append((raw, 1.0, False))
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)

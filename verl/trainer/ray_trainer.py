@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface.
 import json
 import os
 import re
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -41,7 +42,7 @@ from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
 from ..utils.dataset import process_image
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
-from ..utils.logger import Tracker
+from ..utils.logger import Tracker, TrainingProgressLogger
 from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from ..workers.fsdp_workers import FSDPWorker
@@ -169,8 +170,19 @@ def _tool_call_from_action(action: str) -> str:
         parsed = parsed["arguments"]
     if not isinstance(parsed, dict) or "action" not in parsed:
         return action
+    # Some legacy trajectory JSONL files use a fixed action schema and retain
+    # irrelevant keys as null. They are not part of the mobile_use schema and
+    # would otherwise be copied into patched rollout history.
+    parsed = {key: value for key, value in parsed.items() if value is not None}
     tool_call = {"name": "mobile_use", "arguments": parsed}
     return f"<tool_call>\n{json.dumps(tool_call, ensure_ascii=False, separators=(',', ':'))}\n</tool_call>"
+
+
+def _compact_ui_action(action: Any) -> Any:
+    """Drop legacy null placeholders before using an expert action as reward GT."""
+    if not isinstance(action, dict):
+        return action
+    return {key: value for key, value in action.items() if value is not None}
 
 
 def _format_model_response_for_history(response: str, fallback_action: str) -> str:
@@ -202,7 +214,7 @@ def _build_semi_online_prompt(
         + f"Goal: {goal.strip()}\n\n"
         "Previous model outputs:\n"
         f"{_history_text(history)}\n\n"
-        "Predict the next Android GUI action using the required thinking and tool-call format."
+        "Predict the next Android GUI action using the required thinking and mobile_use JSON format."
     )
     if format_prompt:
         return Template(format_prompt.strip()).render(content=content)
@@ -260,6 +272,7 @@ class RayPPOTrainer:
         ray_worker_group_cls: Type[RayWorkerGroup] = RayWorkerGroup,
         reward_fn: Optional[AutoRewardManager] = None,
         val_reward_fn: Optional[AutoRewardManager] = None,
+        progress_logger: Optional[TrainingProgressLogger] = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -268,6 +281,7 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.progress_logger = progress_logger
         self._semi_online_format_prompt = None
         if config.data.format_prompt:
             with open(config.data.format_prompt, encoding="utf-8") as f:
@@ -342,6 +356,12 @@ class RayPPOTrainer:
         config.worker.actor.optim.training_steps = self.training_steps
         config.worker.critic.optim.training_steps = self.training_steps
         print(f"Total training steps: {self.training_steps}")
+
+    def _progress(self, phase: str, status: str, **fields: Any) -> None:
+        """Emit a concise milestone without changing framework console logging."""
+        progress_logger = getattr(self, "progress_logger", None)
+        if progress_logger is not None:
+            progress_logger.log(phase, status, step=getattr(self, "global_step", None), **fields)
 
     def _should_save_checkpoint(self) -> bool:
         by_step = self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0
@@ -532,11 +552,14 @@ class RayPPOTrainer:
             load_checkpoint_path = None
 
         if load_checkpoint_path is None:
+            self._progress("CHECKPOINT_LOAD", "SKIP", reason="no_checkpoint_requested")
             return
 
         if "global_step_" not in load_checkpoint_path.strip(os.path.sep).split(os.path.sep)[-1]:
             raise ValueError("`load_checkpoint_path` should end with `global_step_*`.")
 
+        checkpoint_started = time.perf_counter()
+        self._progress("CHECKPOINT_LOAD", "START", path=load_checkpoint_path)
         print(f"Load from checkpoint: {load_checkpoint_path}.")
         self.global_step = int(load_checkpoint_path.strip(os.path.sep).split("global_step_")[-1])
         actor_path = os.path.join(load_checkpoint_path, "actor")
@@ -551,6 +574,7 @@ class RayPPOTrainer:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+        self._progress("CHECKPOINT_LOAD", "END", elapsed_s=time.perf_counter() - checkpoint_started)
 
     def _maybe_log_val_generations(
         self, inputs: list[str], outputs: list[str], labels: list[str], scores: list[float]
@@ -751,6 +775,7 @@ class RayPPOTrainer:
 
     def _make_semi_online_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         print("Start generating semi-online trajectory batch...")
+        rollout_started = time.perf_counter()
         self._semi_online_rollout_records = []
         try:
             batch_dict = next(self.data_iterator)
@@ -774,6 +799,14 @@ class RayPPOTrainer:
             raise ValueError("algorithm.semi_online_generation_micro_batch_size must be non-negative")
         if max_rollouts_per_task < rollout_n:
             raise ValueError("algorithm.semi_online_max_rollouts_per_task must be at least worker.rollout.n")
+        self._progress(
+            "ROLLOUT",
+            "START",
+            tasks=len(source_batch),
+            rollout_n=rollout_n,
+            max_candidates=max_rollouts_per_task,
+            generation_micro_batch=generation_micro_batch_size,
+        )
         for row_idx in range(len(source_batch)):
             task_id = str(source_batch.non_tensor_batch.get("task_id", np.array([row_idx], dtype=object))[row_idx])
             goal = str(source_batch.non_tensor_batch["goal"][row_idx])
@@ -855,6 +888,7 @@ class RayPPOTrainer:
                 counts[str(traj_uid)] += 1
             return {traj_uid: totals[traj_uid] / counts[traj_uid] for traj_uid in totals if counts[traj_uid] > 0}
 
+        wave_index = 0
         while True:
             active_indices = [
                 idx for idx, state in enumerate(states) if not state["finished"] and state["step_pos"] < len(state["steps"])
@@ -925,6 +959,21 @@ class RayPPOTrainer:
                     group["candidate_count"] += 1
                     added_candidates = True
 
+                # These arrays intentionally share selection-group insertion
+                # order: task_ids[i] -> candidate_counts[i] -> diversity_std[i].
+                selection_group_values = list(selection_groups.values())
+                task_ids = [group["task_id"] for group in selection_group_values]
+                candidate_counts = [group["candidate_count"] for group in selection_group_values]
+                diversity_stds = [round(float(group["diversity_std"]), 4) for group in selection_group_values]
+                self._progress(
+                    "DIVERSITY",
+                    "RETRY" if added_candidates else "READY",
+                    task_ids=task_ids,
+                    candidate_counts=candidate_counts,
+                    diversity_std=diversity_stds,
+                    threshold=self.config.algorithm.semi_online_advantage_std_threshold,
+                    threshold_met=sum(group["diversity_threshold_met"] for group in selection_group_values),
+                )
                 if added_candidates:
                     continue
                 break
@@ -934,7 +983,7 @@ class RayPPOTrainer:
                 state = states[state_idx]
                 step = state["steps"][state["step_pos"]]
                 step_id = step.get("step_id", state["step_pos"])
-                answer = json.dumps(step["action"], ensure_ascii=False, separators=(",", ":"))
+                answer = json.dumps(_compact_ui_action(step["action"]), ensure_ascii=False, separators=(",", ":"))
                 image_start = max(0, state["step_pos"] - image_limit + 1)
                 images = [item["image"] for item in state["steps"][image_start : state["step_pos"] + 1]]
                 all_examples.append(
@@ -954,6 +1003,17 @@ class RayPPOTrainer:
                 )
 
             chunk_size = generation_micro_batch_size or len(all_examples)
+            wave_index += 1
+            wave_started = time.perf_counter()
+            wave_rewards: dict[str, list[float]] = defaultdict(list)
+            self._progress(
+                "ROLLOUT_WAVE",
+                "START",
+                wave=wave_index,
+                active_rollout_steps=len(all_examples),
+                active_tasks=len({example["task_id"] for example in all_examples}),
+                vllm_calls=(len(all_examples) + chunk_size - 1) // chunk_size,
+            )
             for chunk_start in range(0, len(all_examples), chunk_size):
                 examples = all_examples[chunk_start : chunk_start + chunk_size]
                 step_batch = self._encode_semi_online_examples(examples, meta_info=meta_info)
@@ -972,6 +1032,11 @@ class RayPPOTrainer:
                 step_batch.batch["token_level_scores"] = reward_tensor
                 for key, values in reward_metrics.items():
                     step_batch.non_tensor_batch[key] = np.array(values, dtype=object)
+                    for value in values:
+                        try:
+                            wave_rewards[key].append(float(value))
+                        except (TypeError, ValueError):
+                            pass
 
                 extract_match = []
                 response_lengths = torch.sum(step_batch.batch["response_mask"], dim=-1)
@@ -1031,6 +1096,15 @@ class RayPPOTrainer:
                         state["progress_logged"] = True
                         completed_states.append(state)
                 self._write_semi_online_rollout_progress(completed_states)
+            reward_summary = {f"{key}_mean": float(np.mean(values)) for key, values in wave_rewards.items() if values}
+            self._progress("REWARD", "SUMMARY", wave=wave_index, **reward_summary)
+            self._progress(
+                "ROLLOUT_WAVE",
+                "END",
+                wave=wave_index,
+                elapsed_s=time.perf_counter() - wave_started,
+                active_rollout_steps=len(all_examples),
+            )
 
         if not step_batches:
             raise RuntimeError("Semi-online rollout produced no training samples.")
@@ -1097,6 +1171,15 @@ class RayPPOTrainer:
                 for key, value in event["reward"].items():
                     selected_reward_metrics[key].append(value)
         metrics.update({f"reward/{key}": value for key, value in reduce_metrics(selected_reward_metrics).items()})
+        self._progress(
+            "ROLLOUT",
+            "END",
+            elapsed_s=time.perf_counter() - rollout_started,
+            selected_rollouts=len(selected_states),
+            candidate_counts=[group["candidate_count"] for group in selection_groups.values()],
+            overall_reward_mean=ui_s1_metrics["uis1/step_reward_mean"],
+            advantage_std=ui_s1_metrics["uis1/advantage_std"],
+        )
         return batch
 
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
@@ -1202,6 +1285,7 @@ class RayPPOTrainer:
         """
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
         self.global_step = 0
+        self._progress("TRAINING_LOOP", "START", planned_steps=self.training_steps)
         main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
         val_metrics: Optional[dict[str, Any]] = None
 
@@ -1222,12 +1306,22 @@ class RayPPOTrainer:
             raise ValueError("UI-S1 semi-online RL requires algorithm.use_kl_loss=true so KL remains separate from returns.")
         while self.global_step < self.training_steps:
             self.global_step += 1
+            self._progress(
+                "STEP",
+                "START",
+                tasks_per_update=self.config.data.rollout_batch_size,
+                rollout_n=self.config.worker.rollout.n,
+                generation_micro_batch=self.config.algorithm.semi_online_generation_micro_batch_size,
+            )
 
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
                 # make a batch of data
                 with timer("gen", timing_raw):
+                    sync_started = time.perf_counter()
+                    self._progress("ROLLOUT_ENGINE_SYNC", "START", direction="actor_to_vllm")
                     self.actor_rollout_ref_wg.prepare_rollout_engine()
+                    self._progress("ROLLOUT_ENGINE_SYNC", "END", elapsed_s=time.perf_counter() - sync_started)
                     if self.config.algorithm.semi_online:
                         candidate_metrics: dict[str, Any] = {}
                         batch = self._make_semi_online_batch_data(metrics=candidate_metrics)
@@ -1240,7 +1334,10 @@ class RayPPOTrainer:
                         metrics.update(ui_s1_metrics)
                     else:
                         batch = self._make_batch_data(metrics=metrics)
+                    release_started = time.perf_counter()
+                    self._progress("ROLLOUT_ENGINE_RELEASE", "START")
                     self.actor_rollout_ref_wg.release_rollout_engine()
+                    self._progress("ROLLOUT_ENGINE_RELEASE", "END", elapsed_s=time.perf_counter() - release_started)
 
                 # balance the number of valid tokens on each dp rank.
                 # NOTE: this breaks the order of data inside the batch.
@@ -1256,15 +1353,19 @@ class RayPPOTrainer:
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
                 # recompute old_log_probs
+                self._progress("OLD_LOG_PROBS", "START")
                 with timer("old", timing_raw):
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
+                self._progress("OLD_LOG_PROBS", "END", elapsed_s=timing_raw["old"])
 
                 # compute ref_log_probs
                 if self.use_reference_policy:
+                    self._progress("REF_LOG_PROBS", "START")
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
+                    self._progress("REF_LOG_PROBS", "END", elapsed_s=timing_raw["ref"])
 
                 # compute values
                 if self.use_critic:
@@ -1297,6 +1398,12 @@ class RayPPOTrainer:
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                         )
+                self._progress(
+                    "ADVANTAGE",
+                    "END",
+                    elapsed_s=timing_raw["adv"],
+                    advantage_std=batch.meta_info.get("ui_s1_metrics", {}).get("uis1/advantage_std"),
+                )
 
                 # update critic
                 if self.use_critic:
@@ -1308,6 +1415,7 @@ class RayPPOTrainer:
 
                 # update actor
                 if self.config.trainer.critic_warmup <= self.global_step:
+                    self._progress("ACTOR_UPDATE", "START")
                     with timer("update_actor", timing_raw):
                         actor_batch = batch
                         if self.config.algorithm.semi_online:
@@ -1328,6 +1436,15 @@ class RayPPOTrainer:
                     metrics.update(actor_metrics)
                     if self.config.algorithm.semi_online:
                         self._write_semi_online_update_result(self._semi_online_rollout_records)
+                    self._progress(
+                        "ACTOR_UPDATE",
+                        "END",
+                        elapsed_s=timing_raw["update_actor"],
+                        padding=metrics.get("uis1/actor_update_padding"),
+                        pg_loss=actor_metrics.get("actor/pg_loss"),
+                        kl_loss=actor_metrics.get("actor/kl_loss"),
+                        grad_norm=actor_metrics.get("actor/grad_norm"),
+                    )
 
                 # validate
                 if (
@@ -1341,8 +1458,10 @@ class RayPPOTrainer:
                     metrics.update(val_metrics)
 
                 if self._should_save_checkpoint():
+                    self._progress("CHECKPOINT_SAVE", "START")
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
+                    self._progress("CHECKPOINT_SAVE", "END", elapsed_s=timing_raw["save_checkpoint"])
 
             # collect metrics
             num_gpus = self.resource_pool_manager.get_num_gpus()
@@ -1351,6 +1470,16 @@ class RayPPOTrainer:
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
 
             self.logger.log(data=metrics, step=self.global_step)
+            self._progress(
+                "STEP",
+                "END",
+                elapsed_s=timing_raw["step"],
+                generation_s=timing_raw.get("gen"),
+                old_log_probs_s=timing_raw.get("old"),
+                ref_log_probs_s=timing_raw.get("ref"),
+                actor_update_s=timing_raw.get("update_actor"),
+                throughput=metrics.get("perf/throughput"),
+            )
             main_tqdm.update()
 
         # perform validation after training
@@ -1366,4 +1495,8 @@ class RayPPOTrainer:
             print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
 
         if not self._should_save_checkpoint():
+            final_checkpoint_started = time.perf_counter()
+            self._progress("CHECKPOINT_SAVE", "START", final=True)
             self._save_checkpoint()
+            self._progress("CHECKPOINT_SAVE", "END", final=True, elapsed_s=time.perf_counter() - final_checkpoint_started)
+        self._progress("TRAINING_LOOP", "END", completed_steps=self.global_step)
