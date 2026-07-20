@@ -13,6 +13,11 @@ import random
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .trajectory_sampling import sample_trajectories, validate_dataset_name, validate_sample_ratio
+else:
+    from trajectory_sampling import sample_trajectories, validate_dataset_name, validate_sample_ratio
+
 
 def action_to_json(action: dict[str, Any]) -> str:
     return json.dumps(action, ensure_ascii=False, separators=(",", ":"))
@@ -80,6 +85,13 @@ def amex_instruction_paths(amex_dir: Path) -> list[Path]:
     return sorted(instruction_dir.glob("*.json"))
 
 
+def has_trajectory_steps(instruction_path: Path) -> bool:
+    """Return whether an instruction can produce a non-empty trajectory."""
+    with instruction_path.open("r", encoding="utf-8") as f:
+        item = json.load(f)
+    return any(step.get("image_path") for step in item.get("steps", []))
+
+
 def split_trajectories(
     instruction_paths: list[Path], train_ratio: float, val_ratio: float, seed: int
 ) -> dict[str, list[Path]]:
@@ -140,13 +152,24 @@ def convert_amex_dir(
     seed: int,
     limit_trajectories: int | None,
     overwrite: bool,
+    sample_ratio: float = 1.0,
+    dataset_name: str = "ui_s1_amex_rl",
 ) -> tuple[int, int, int]:
+    validate_sample_ratio(sample_ratio)
+    validate_dataset_name(dataset_name)
+    if limit_trajectories is not None and limit_trajectories < 1:
+        raise ValueError("--limit-trajectories must be positive")
+    if sample_ratio < 1 and limit_trajectories is not None:
+        raise ValueError("--sample-ratio cannot be combined with --limit-trajectories")
     output_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = output_dir / (
+        "conversion_stats.json" if dataset_name == "ui_s1_amex_rl" else f"{dataset_name}_stats.json"
+    )
     output_paths = [
-        output_dir / "ui_s1_amex_rl_train.jsonl",
-        output_dir / "ui_s1_amex_rl_val.jsonl",
-        output_dir / "ui_s1_amex_rl_test.jsonl",
-        output_dir / "conversion_stats.json",
+        output_dir / f"{dataset_name}_train.jsonl",
+        output_dir / f"{dataset_name}_val.jsonl",
+        output_dir / f"{dataset_name}_test.jsonl",
+        stats_path,
     ]
     if not overwrite and any(path.exists() for path in output_paths):
         raise FileExistsError(f"Output already exists in {output_dir}; pass --overwrite to replace it")
@@ -155,16 +178,24 @@ def convert_amex_dir(
         raise FileNotFoundError(f"AMEX screenshot directory not found: {source_screenshot_dir}")
     instruction_paths = amex_instruction_paths(amex_dir)
     split_paths = split_trajectories(instruction_paths, train_ratio, val_ratio, seed)
-    train_paths = split_paths["train"]
-    val_paths = split_paths["val"]
-    test_paths = split_paths["test"]
+    eligible_paths = {
+        split: [path for path in paths if has_trajectory_steps(path)]
+        for split, paths in split_paths.items()
+    }
+    sampled_paths = {
+        split: sample_trajectories(paths, sample_ratio, seed, split)
+        for split, paths in eligible_paths.items()
+    }
+    train_paths = sampled_paths["train"]
+    val_paths = sampled_paths["val"]
+    test_paths = sampled_paths["test"]
     if limit_trajectories is not None:
         train_paths = train_paths[:limit_trajectories]
 
     counts = []
     action_counts: dict[str, int] = {}
     for split, paths in (("train", train_paths), ("val", val_paths), ("test", test_paths)):
-        output_path = output_dir / f"ui_s1_amex_rl_{split}.jsonl"
+        output_path = output_dir / f"{dataset_name}_{split}.jsonl"
         count = 0
         with output_path.open("w", encoding="utf-8") as f:
             for instruction_path in paths:
@@ -179,18 +210,19 @@ def convert_amex_dir(
         counts.append(count)
     stats = {
         "source": "amex",
-        "split_strategy": "seeded_episode_shuffle_8_1_1",
+        "dataset_name": dataset_name,
+        "split_strategy": "seeded_trajectory_shuffle",
         "split_ratios": {"train": train_ratio, "val": val_ratio, "test": round(1.0 - train_ratio - val_ratio, 10)},
         "seed": seed,
+        "sample_ratio": sample_ratio,
+        "available_episode_counts": {split: len(paths) for split, paths in eligible_paths.items()},
         "limit_trajectories": limit_trajectories,
         "episode_counts": {"train": counts[0], "val": counts[1], "test": counts[2]},
         "action_counts": dict(sorted(action_counts.items())),
         "source_screenshot_dir": str(source_screenshot_dir),
         "image_path_mode": "direct",
     }
-    (output_dir / "conversion_stats.json").write_text(
-        json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return counts[0], counts[1], counts[2]
 
 
@@ -207,6 +239,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--val-ratio", type=float, default=0.1, help="AMEX trajectory-level validation split ratio.")
     parser.add_argument("--seed", type=int, default=42, help="Deterministic episode-level AMEX split seed.")
+    parser.add_argument(
+        "--sample-ratio",
+        type=float,
+        default=1.0,
+        help="Randomly retain this fraction of complete trajectories in every split (0 < ratio <= 1).",
+    )
+    parser.add_argument(
+        "--dataset-name",
+        default="ui_s1_amex_rl",
+        help="Output dataset filename prefix (default: ui_s1_amex_rl).",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -233,6 +276,8 @@ def main() -> None:
         seed=args.seed,
         limit_trajectories=args.limit_trajectories,
         overwrite=args.overwrite,
+        sample_ratio=args.sample_ratio,
+        dataset_name=args.dataset_name,
     )
     print(f"Wrote {train_count} AMEX train trajectories.")
     print(f"Wrote {val_count} AMEX validation trajectories.")

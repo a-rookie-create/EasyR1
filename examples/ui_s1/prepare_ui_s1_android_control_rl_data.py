@@ -17,6 +17,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable
 
+if __package__:
+    from .trajectory_sampling import sample_trajectories, validate_dataset_name, validate_sample_ratio
+else:
+    from trajectory_sampling import sample_trajectories, validate_dataset_name, validate_sample_ratio
+
 
 def read_varint(buf: bytes, pos: int) -> tuple[int, int]:
     shift = 0
@@ -208,6 +213,23 @@ def build_trajectory(episode: dict[str, Any], image_dir: Path) -> tuple[dict[str
     )
 
 
+def collect_eligible_episode_ids(
+    data_dir: Path, official_splits: dict[str, set[int]], target_splits: list[str]
+) -> dict[str, list[int]]:
+    """Collect IDs that belong to a split and contain a complete, usable trajectory."""
+    eligible_ids = {split: [] for split in target_splits}
+    for episode in iter_episodes(data_dir):
+        if not episode["actions"]:
+            continue
+        split = next(
+            (name for name in target_splits if episode["episode_id"] in official_splits.get(name, set())),
+            None,
+        )
+        if split is not None:
+            eligible_ids[split].append(episode["episode_id"])
+    return eligible_ids
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -219,33 +241,73 @@ def main() -> None:
     parser.add_argument("--image-dir", type=Path, required=True, help="Directory containing prepared training images.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for trajectory JSONL files.")
     parser.add_argument("--limit-episodes", type=int, default=None, help="Optional limit per split for a smoke conversion.")
+    parser.add_argument(
+        "--sample-ratio",
+        type=float,
+        default=1.0,
+        help="Randomly retain this fraction of complete trajectories in every split (0 < ratio <= 1).",
+    )
+    parser.add_argument(
+        "--dataset-name",
+        default="ui_s1_android_control_rl",
+        help="Output dataset filename prefix (default: ui_s1_android_control_rl).",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Deterministic trajectory sampling seed.")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing existing generated JSONL files.")
     args = parser.parse_args()
 
+    validate_sample_ratio(args.sample_ratio)
+    validate_dataset_name(args.dataset_name)
+    if args.limit_episodes is not None and args.limit_episodes < 1:
+        raise ValueError("--limit-episodes must be positive")
+    if args.sample_ratio < 1 and args.limit_episodes is not None:
+        raise ValueError("--sample-ratio cannot be combined with --limit-episodes")
+
     official_splits = load_official_splits(args.android_control_dir)
     target_splits = ["train", "validation", "test"]
-    output_handles = {}
-    counts = Counter()
-    skipped_empty_episodes = Counter()
-    action_counts: Counter[str] = Counter()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = args.output_dir / (
+        "conversion_stats.json"
+        if args.dataset_name == "ui_s1_android_control_rl"
+        else f"{args.dataset_name}_stats.json"
+    )
     output_paths = [
-        args.output_dir / "ui_s1_android_control_rl_train.jsonl",
-        args.output_dir / "ui_s1_android_control_rl_val.jsonl",
-        args.output_dir / "conversion_stats.json",
+        args.output_dir / f"{args.dataset_name}_train.jsonl",
+        args.output_dir / f"{args.dataset_name}_val.jsonl",
+        args.output_dir / f"{args.dataset_name}_test.jsonl",
+        stats_path,
     ]
-    output_paths.append(args.output_dir / "ui_s1_android_control_rl_test.jsonl")
     if not args.overwrite and any(path.exists() for path in output_paths):
         raise FileExistsError(f"Output already exists in {args.output_dir}; pass --overwrite to replace it")
     if not args.image_dir.is_dir():
         raise FileNotFoundError(f"Extracted AndroidControl image directory not found: {args.image_dir}")
+
+    output_handles = {}
+    counts = Counter()
+    skipped_empty_episodes = Counter()
+    action_counts: Counter[str] = Counter()
+    available_episode_counts: dict[str, int] | None = None
+    selected_episode_ids: dict[str, set[int]] | None = None
+    if args.sample_ratio < 1:
+        eligible_ids = collect_eligible_episode_ids(args.android_control_dir, official_splits, target_splits)
+        available_episode_counts = {split: len(ids) for split, ids in eligible_ids.items()}
+        selected_episode_ids = {
+            split: set(sample_trajectories(ids, args.sample_ratio, args.seed, split))
+            for split, ids in eligible_ids.items()
+        }
     try:
         for split in target_splits:
             name = "val" if split == "validation" else split
-            output_handles[split] = (args.output_dir / f"ui_s1_android_control_rl_{name}.jsonl").open("w", encoding="utf-8")
+            output_handles[split] = (args.output_dir / f"{args.dataset_name}_{name}.jsonl").open(
+                "w", encoding="utf-8"
+            )
         for episode in iter_episodes(args.android_control_dir):
             split = next((name for name in target_splits if episode["episode_id"] in official_splits.get(name, set())), None)
-            if split is None or (args.limit_episodes is not None and counts[split] >= args.limit_episodes):
+            if split is None:
+                continue
+            if selected_episode_ids is not None and episode["episode_id"] not in selected_episode_ids[split]:
+                continue
+            if args.limit_episodes is not None and counts[split] >= args.limit_episodes:
                 continue
             trajectory, episode_actions = build_trajectory(episode, args.image_dir)
             if trajectory is None:
@@ -260,8 +322,12 @@ def main() -> None:
 
     stats = {
         "source": "android_control",
+        "dataset_name": args.dataset_name,
         "split_strategy": "official_episode_split",
         "included_splits": target_splits,
+        "sample_ratio": args.sample_ratio,
+        "seed": args.seed,
+        "available_episode_counts": available_episode_counts or dict(counts),
         "episode_counts": dict(counts),
         "skipped_empty_action_episodes": dict(skipped_empty_episodes),
         "action_counts": dict(sorted(action_counts.items())),
@@ -269,7 +335,7 @@ def main() -> None:
         "image_path_mode": "direct",
         "limit_episodes": args.limit_episodes,
     }
-    (args.output_dir / "conversion_stats.json").write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Wrote AndroidControl trajectories: {dict(counts)}")
 
 
