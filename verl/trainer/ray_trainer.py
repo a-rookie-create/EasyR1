@@ -25,6 +25,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
+from itertools import combinations
 from typing import Any, Optional, Type
 
 import numpy as np
@@ -183,6 +184,32 @@ def _compact_ui_action(action: Any) -> Any:
     if not isinstance(action, dict):
         return action
     return {key: value for key, value in action.items() if value is not None}
+
+
+def _select_most_diverse_rollout_subset(
+    candidate_states: list[dict[str, Any]], selection_scores: dict[str, float], selected_count: int
+) -> tuple[list[dict[str, Any]], float]:
+    """Choose the fixed-size candidate subset with the greatest score spread.
+
+    UI-S1's default candidate pool is eight and it retains four trajectories,
+    so this evaluates only C(8, 4)=70 combinations. Iteration order makes ties
+    deterministic and preserves the earlier candidates when their diversity is
+    identical.
+    """
+    if len(candidate_states) < selected_count:
+        raise ValueError("candidate pool must contain at least selected_count trajectories")
+
+    from examples.ui_s1.advantage_ui_s1 import rollout_score_std
+
+    best_subset: tuple[dict[str, Any], ...] | None = None
+    best_std = float("-inf")
+    for subset in combinations(candidate_states, selected_count):
+        diversity_std = rollout_score_std([selection_scores[state["traj_uid"]] for state in subset])
+        if diversity_std > best_std:
+            best_subset = subset
+            best_std = diversity_std
+    assert best_subset is not None
+    return list(best_subset), best_std
 
 
 def _format_model_response_for_history(response: str, fallback_action: str) -> str:
@@ -595,20 +622,37 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> dict[str, Any]:
+        validation_started = time.perf_counter()
         reward_tensor_lst = []
         # Lists to collect samples for the table
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
         reward_metrics_lst = defaultdict(list)
         length_metrics_lst = defaultdict(list)
+        total_batches = len(self.val_dataloader)
+        repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
+        progress_interval = self.config.trainer.progress_validation_interval
+        if progress_interval < 1:
+            raise ValueError("trainer.progress_validation_interval must be positive")
+        completed_prompts = 0
         print("Start validation...")
+        self._progress(
+            "VALIDATION",
+            "START",
+            total_batches=total_batches,
+            batch_size=self.config.data.val_batch_size,
+            generation_n=repeat_times,
+        )
+        validation_sync_started = time.perf_counter()
+        self._progress("VALIDATION_ENGINE_SYNC", "START", direction="actor_to_vllm")
         self.actor_rollout_ref_wg.prepare_rollout_engine()
-        for batch_dict in self.val_dataloader:
+        self._progress("VALIDATION_ENGINE_SYNC", "END", elapsed_s=time.perf_counter() - validation_sync_started)
+        for batch_index, batch_dict in enumerate(self.val_dataloader, start=1):
             test_batch = DataProto.from_single_dict(batch_dict)
+            completed_prompts += len(test_batch)
             test_gen_batch = test_batch.pop(
                 batch_keys=["input_ids", "attention_mask", "position_ids"],
                 non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
             )
-            repeat_times = self.config.worker.rollout.val_override_config.get("n", 1)
             test_gen_batch.meta_info = self.config.worker.rollout.val_override_config
             test_gen_batch.meta_info["min_pixels"] = self.config.data.min_pixels
             test_gen_batch.meta_info["max_pixels"] = self.config.data.max_pixels
@@ -643,13 +687,37 @@ class RayPPOTrainer:
             for key, value in compute_length_metrics(test_batch).items():
                 length_metrics_lst[key].append(value)
 
+            if batch_index % progress_interval == 0 or batch_index == total_batches:
+                overall_rewards = reward_metrics_lst.get("overall", [])
+                self._progress(
+                    "VALIDATION",
+                    "PROGRESS",
+                    completed_batches=batch_index,
+                    total_batches=total_batches,
+                    completed_prompts=completed_prompts,
+                    overall_reward_mean=float(np.mean(overall_rewards)) if overall_rewards else None,
+                    elapsed_s=time.perf_counter() - validation_started,
+                )
+
+        validation_release_started = time.perf_counter()
+        self._progress("VALIDATION_ENGINE_RELEASE", "START")
         self.actor_rollout_ref_wg.release_rollout_engine()
+        self._progress("VALIDATION_ENGINE_RELEASE", "END", elapsed_s=time.perf_counter() - validation_release_started)
         self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
         self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
         val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
         val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
         print("Finish validation.")
-        return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
+        validation_result = {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
+        self._progress(
+            "VALIDATION",
+            "END",
+            elapsed_s=time.perf_counter() - validation_started,
+            completed_prompts=completed_prompts,
+            overall_reward=validation_result.get("val/overall_reward"),
+            accuracy_reward=validation_result.get("val/accuracy_reward"),
+        )
+        return validation_result
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -793,18 +861,22 @@ class RayPPOTrainer:
         image_limit = self.config.algorithm.semi_online_image_limit
         generation_micro_batch_size = self.config.algorithm.semi_online_generation_micro_batch_size
         max_rollouts_per_task = self.config.algorithm.semi_online_max_rollouts_per_task
+        diversity_refill_batch_size = self.config.algorithm.semi_online_diversity_refill_batch_size
         if image_limit < 1:
             raise ValueError("algorithm.semi_online_image_limit must be at least 1")
         if generation_micro_batch_size < 0:
             raise ValueError("algorithm.semi_online_generation_micro_batch_size must be non-negative")
         if max_rollouts_per_task < rollout_n:
             raise ValueError("algorithm.semi_online_max_rollouts_per_task must be at least worker.rollout.n")
+        if diversity_refill_batch_size < 1:
+            raise ValueError("algorithm.semi_online_diversity_refill_batch_size must be positive")
         self._progress(
             "ROLLOUT",
             "START",
             tasks=len(source_batch),
             rollout_n=rollout_n,
             max_candidates=max_rollouts_per_task,
+            diversity_refill_batch=diversity_refill_batch_size,
             generation_micro_batch=generation_micro_batch_size,
         )
         for row_idx in range(len(source_batch)):
@@ -816,9 +888,10 @@ class RayPPOTrainer:
                 "task_id": task_id,
                 "goal": goal,
                 "steps": steps,
+                "group_key": group_key,
+                "candidates": [],
                 "selected": [],
                 "candidate_count": 0,
-                "pending_candidate": None,
             }
             selection_groups[group_key] = group
             for rollout_id in range(rollout_n):
@@ -839,6 +912,7 @@ class RayPPOTrainer:
                     "selection_reason": "initial_rollout_retained",
                 }
                 states.append(state)
+                group["candidates"].append(state)
                 group["selected"].append(state)
                 group["candidate_count"] += 1
 
@@ -894,83 +968,83 @@ class RayPPOTrainer:
                 idx for idx, state in enumerate(states) if not state["finished"] and state["step_pos"] < len(state["steps"])
             ]
             if not active_indices:
-                from examples.ui_s1.advantage_ui_s1 import replace_nearest_rollout, rollout_score_std
-
                 added_candidates = False
+                refill_counts = []
+                evaluated_candidate_counts = []
                 for group in selection_groups.values():
-                    pending_candidate = group["pending_candidate"]
-                    selected_states = group["selected"]
-                    if pending_candidate is not None:
-                        pool_scores = group_raw_total_advantages(selected_states + [pending_candidate])
-                        for state in selected_states + [pending_candidate]:
-                            state["selection_advantage"] = pool_scores[state["traj_uid"]]
-                        selected_scores = [pool_scores[state["traj_uid"]] for state in selected_states]
-                        candidate_score = pool_scores[pending_candidate["traj_uid"]]
-                        replace, nearest_index, candidate_distance, nearest_distance = replace_nearest_rollout(selected_scores, candidate_score)
-                        pending_candidate["selected_for_update"] = False
-                        pending_candidate["selection_reason"] = "candidate_too_close_to_mean"
-                        if replace:
-                            removed_state = selected_states[nearest_index]
-                            removed_state["selected_for_update"] = False
-                            removed_state["selection_reason"] = "replaced_by_more_diverse_candidate"
-                            pending_candidate["selected_for_update"] = True
-                            pending_candidate["selection_reason"] = "replaced_nearest_to_mean"
-                            selected_states[nearest_index] = pending_candidate
-                            print(
-                                "UI-S1 rollout selection: replaced a near-mean rollout "
-                                f"(new distance={candidate_distance:.4f}, removed distance={nearest_distance:.4f})."
+                    candidate_states = group["candidates"]
+                    evaluated_candidate_counts.append(group["candidate_count"])
+                    pool_scores = group_raw_total_advantages(candidate_states)
+                    selected_states, diversity_std = _select_most_diverse_rollout_subset(
+                        candidate_states, pool_scores, rollout_n
+                    )
+                    selected_ids = {state["traj_uid"] for state in selected_states}
+                    for state in candidate_states:
+                        state["selection_advantage"] = pool_scores[state["traj_uid"]]
+                        state["selected_for_update"] = state["traj_uid"] in selected_ids
+                        if state["selected_for_update"]:
+                            state["selection_reason"] = (
+                                "initial_rollout_retained"
+                                if len(candidate_states) == rollout_n
+                                else "selected_max_diversity_subset"
                             )
-                        group["pending_candidate"] = None
+                        else:
+                            state["selection_reason"] = "not_selected_max_diversity_subset"
 
-                    selection_scores = group_raw_total_advantages(selected_states)
-                    for state in selected_states:
-                        state["selection_advantage"] = selection_scores[state["traj_uid"]]
-                    diversity_std = rollout_score_std(list(selection_scores.values()))
-                    group["selection_scores"] = selection_scores
+                    group["selected"] = selected_states
+                    group["selection_scores"] = {
+                        state["traj_uid"]: pool_scores[state["traj_uid"]] for state in selected_states
+                    }
                     group["diversity_std"] = diversity_std
                     group["diversity_threshold_met"] = (
                         self.config.algorithm.semi_online_advantage_std_threshold <= 0.0
                         or diversity_std > self.config.algorithm.semi_online_advantage_std_threshold
                     )
                     if group["diversity_threshold_met"] or group["candidate_count"] >= max_rollouts_per_task:
+                        refill_counts.append(0)
                         continue
 
-                    rollout_id = group["candidate_count"]
-                    candidate = {
-                        "task_id": group["task_id"],
-                        "selection_group_key": next(
-                            key for key, value in selection_groups.items() if value is group
-                        ),
-                        "traj_uid": str(uuid.uuid4()),
-                        "rollout_id": rollout_id,
-                        "goal": group["goal"],
-                        "steps": group["steps"],
-                        "step_pos": 0,
-                        "history": [],
-                        "patch_count": 0,
-                        "finished": False,
-                        "events": [],
-                        "progress_logged": False,
-                        "selected_for_update": False,
-                        "selection_reason": "pending_diversity_candidate",
-                    }
-                    states.append(candidate)
-                    group["pending_candidate"] = candidate
-                    group["candidate_count"] += 1
-                    added_candidates = True
+                    refill_count = min(
+                        diversity_refill_batch_size, max_rollouts_per_task - group["candidate_count"]
+                    )
+                    refill_counts.append(refill_count)
+                    for _ in range(refill_count):
+                        rollout_id = group["candidate_count"]
+                        candidate = {
+                            "task_id": group["task_id"],
+                            "selection_group_key": group["group_key"],
+                            "traj_uid": str(uuid.uuid4()),
+                            "rollout_id": rollout_id,
+                            "goal": group["goal"],
+                            "steps": group["steps"],
+                            "step_pos": 0,
+                            "history": [],
+                            "patch_count": 0,
+                            "finished": False,
+                            "events": [],
+                            "progress_logged": False,
+                            "selected_for_update": False,
+                            "selection_reason": "pending_diversity_candidate",
+                        }
+                        states.append(candidate)
+                        group["candidates"].append(candidate)
+                        group["candidate_count"] += 1
+                        added_candidates = True
 
                 # These arrays intentionally share selection-group insertion
                 # order: task_ids[i] -> candidate_counts[i] -> diversity_std[i].
                 selection_group_values = list(selection_groups.values())
                 task_ids = [group["task_id"] for group in selection_group_values]
-                candidate_counts = [group["candidate_count"] for group in selection_group_values]
+                next_candidate_counts = [group["candidate_count"] for group in selection_group_values]
                 diversity_stds = [round(float(group["diversity_std"]), 4) for group in selection_group_values]
                 self._progress(
                     "DIVERSITY",
                     "RETRY" if added_candidates else "READY",
                     task_ids=task_ids,
-                    candidate_counts=candidate_counts,
+                    candidate_counts=evaluated_candidate_counts,
                     diversity_std=diversity_stds,
+                    refill_counts=refill_counts,
+                    next_candidate_counts=next_candidate_counts,
                     threshold=self.config.algorithm.semi_online_advantage_std_threshold,
                     threshold_met=sum(group["diversity_threshold_met"] for group in selection_group_values),
                 )

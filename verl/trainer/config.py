@@ -112,6 +112,8 @@ class AlgorithmConfig:
     """maximum active trajectories generated together; 0 generates all active trajectories together"""
     semi_online_max_rollouts_per_task: int = 20
     """maximum candidates sampled per task before selecting rollout.n trajectories for one UI-S1 update"""
+    semi_online_diversity_refill_batch_size: int = 4
+    """candidates added at once for each task that fails the UI-S1 diversity threshold"""
 
 
 @dataclass
@@ -156,6 +158,8 @@ class TrainerConfig:
     """JSONL path for semi-online rollout traces; defaults under save_checkpoint_path"""
     progress_log_path: Optional[str] = None
     """human-readable, line-buffered training progress log; defaults under save_checkpoint_path"""
+    progress_validation_interval: int = 25
+    """emit one concise validation-progress record after this many validation batches"""
     load_checkpoint_path: Optional[str] = None
     """load checkpoint path"""
     ray_timeline: Optional[str] = None

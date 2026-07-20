@@ -96,6 +96,14 @@ is_positive_integer "${MAX_ROLLOUTS_PER_TASK}" || {
     echo "MAX_ROLLOUTS_PER_TASK must be a positive integer, got ${MAX_ROLLOUTS_PER_TASK}." >&2
     exit 2
 }
+is_positive_integer "${DIVERSITY_REFILL_BATCH_SIZE}" || {
+    echo "DIVERSITY_REFILL_BATCH_SIZE must be a positive integer, got ${DIVERSITY_REFILL_BATCH_SIZE}." >&2
+    exit 2
+}
+is_positive_integer "${VALIDATION_PROGRESS_INTERVAL}" || {
+    echo "VALIDATION_PROGRESS_INTERVAL must be a positive integer, got ${VALIDATION_PROGRESS_INTERVAL}." >&2
+    exit 2
+}
 if (( MAX_ROLLOUTS_PER_TASK < ROLLOUT_N )); then
     echo "MAX_ROLLOUTS_PER_TASK (${MAX_ROLLOUTS_PER_TASK}) must be at least ROLLOUT_N (${ROLLOUT_N})." >&2
     exit 2
@@ -113,9 +121,25 @@ if (( GENERATION_MICRO_BATCH_SIZE > 0 && GENERATION_MICRO_BATCH_SIZE < N_GPUS_PE
     echo "WARNING: GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE} is below the ${N_GPUS_PER_NODE} visible GPUs; padded duplicate requests cannot increase useful rollout concurrency." >&2
 fi
 
-echo "UI-S1 effective rollout configuration: tasks_per_update=${ROLLOUT_BATCH_SIZE}, selected_rollouts_per_task=${ROLLOUT_N}, max_candidates_per_task=${MAX_ROLLOUTS_PER_TASK}, generation_micro_batch=${GENERATION_MICRO_BATCH_SIZE}, visible_gpus=${N_GPUS_PER_NODE}."
+echo "UI-S1 effective rollout configuration: tasks_per_update=${ROLLOUT_BATCH_SIZE}, selected_rollouts_per_task=${ROLLOUT_N}, max_candidates_per_task=${MAX_ROLLOUTS_PER_TASK}, diversity_refill_batch=${DIVERSITY_REFILL_BATCH_SIZE}, generation_micro_batch=${GENERATION_MICRO_BATCH_SIZE}, visible_gpus=${N_GPUS_PER_NODE}."
 
 cd "${EASYR1_ROOT}"
+
+GPU_MEMORY_MONITOR_PATH="${RUN_DIR}/gpu_memory_peak.json"
+python3 -B examples/ui_s1/monitor_gpu_memory.py \
+    --gpu-ids "${GPU_IDS}" \
+    --output "${GPU_MEMORY_MONITOR_PATH}" \
+    --interval-seconds "${GPU_MEMORY_MONITOR_INTERVAL_SECONDS}" \
+    --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}" &
+GPU_MEMORY_MONITOR_PID=$!
+stop_gpu_memory_monitor() {
+    if kill -0 "${GPU_MEMORY_MONITOR_PID}" 2>/dev/null; then
+        kill -TERM "${GPU_MEMORY_MONITOR_PID}" 2>/dev/null || true
+        wait "${GPU_MEMORY_MONITOR_PID}" || true
+    fi
+}
+trap stop_gpu_memory_monitor EXIT
+echo "GPU memory monitor: ${GPU_MEMORY_MONITOR_PATH} (interval=${GPU_MEMORY_MONITOR_INTERVAL_SECONDS}s)"
 
 if [[ -z "${TRAIN_FILE:-}" ]]; then
     train_candidates=("${DATA_DIR}"/*_train.jsonl)
@@ -156,6 +180,7 @@ python3 -m verl.trainer.main \
     algorithm.semi_online_image_limit=${HISTORY_IMAGE_LIMIT} \
     algorithm.semi_online_generation_micro_batch_size=${GENERATION_MICRO_BATCH_SIZE} \
     algorithm.semi_online_max_rollouts_per_task=${MAX_ROLLOUTS_PER_TASK} \
+    algorithm.semi_online_diversity_refill_batch_size=${DIVERSITY_REFILL_BATCH_SIZE} \
     algorithm.use_kl_loss=true \
     algorithm.kl_coef=1.0e-4 \
     worker.actor.global_batch_size=${ACTOR_GLOBAL_BATCH_SIZE} \
@@ -196,4 +221,5 @@ python3 -m verl.trainer.main \
     trainer.save_checkpoint_path=${RUN_DIR} \
     trainer.rollout_log_path=${RUN_DIR}/semi_online_rollouts.jsonl \
     trainer.progress_log_path=${RUN_DIR}/training_progress.log \
+    trainer.progress_validation_interval=${VALIDATION_PROGRESS_INTERVAL} \
     trainer.find_last_checkpoint=false

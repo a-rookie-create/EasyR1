@@ -1,7 +1,13 @@
 import json
 from types import SimpleNamespace
 
-from verl.trainer.ray_trainer import RayPPOTrainer, _build_semi_online_prompt, _compact_ui_action, _tool_call_from_action
+from verl.trainer.ray_trainer import (
+    RayPPOTrainer,
+    _build_semi_online_prompt,
+    _compact_ui_action,
+    _select_most_diverse_rollout_subset,
+    _tool_call_from_action,
+)
 from verl.utils.logger import TrainingProgressLogger
 
 
@@ -25,6 +31,27 @@ def test_legacy_null_action_fields_are_removed_before_reward_and_patch_history()
     assert '"text"' not in _tool_call_from_action(json.dumps(action))
 
 
+def test_diversity_refill_selects_the_most_diverse_fixed_size_subset():
+    candidates = [{"traj_uid": f"trajectory-{idx}"} for idx in range(8)]
+    scores = {
+        "trajectory-0": 0.0,
+        "trajectory-1": 0.0,
+        "trajectory-2": 0.0,
+        "trajectory-3": 0.0,
+        "trajectory-4": -10.0,
+        "trajectory-5": 10.0,
+        "trajectory-6": 0.0,
+        "trajectory-7": 0.0,
+    }
+
+    selected, diversity_std = _select_most_diverse_rollout_subset(candidates, scores, selected_count=4)
+
+    selected_ids = {state["traj_uid"] for state in selected}
+    assert len(selected) == 4
+    assert {"trajectory-4", "trajectory-5"}.issubset(selected_ids)
+    assert diversity_std > 0.0
+
+
 def test_training_progress_log_is_human_readable_and_flushed(tmp_path):
     path = tmp_path / "training_progress.log"
     progress = TrainingProgressLogger(str(path))
@@ -35,6 +62,8 @@ def test_training_progress_log_is_human_readable_and_flushed(tmp_path):
         task_ids=["task-a", "task-b"],
         candidate_counts=[5, 4],
         diversity_std=[0.1234, 0.5678],
+        refill_counts=[4, 0],
+        next_candidate_counts=[8, 4],
         elapsed_s=0.25,
     )
 
@@ -43,6 +72,8 @@ def test_training_progress_log_is_human_readable_and_flushed(tmp_path):
     assert 'task_ids=["task-a","task-b"]' in line
     assert "candidate_counts=[5,4]" in line
     assert "diversity_std=[0.1234,0.5678]" in line
+    assert "refill_counts=[4,0]" in line
+    assert "next_candidate_counts=[8,4]" in line
     assert "elapsed_s=0.2500" in line
 
 

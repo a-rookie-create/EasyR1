@@ -14,10 +14,13 @@
 | `ACTOR_GLOBAL_BATCH_SIZE` | `4` | actor 更新的全局 batch 大小。 |
 | `ROLLOUT_N` | `4` | 每个任务初始生成并最终希望保留的 rollout 数量。 |
 | `MAX_ROLLOUTS_PER_TASK` | `8` | 某任务未达到 advantage diversity 要求时，候选 rollout 的上限。 |
+| `DIVERSITY_REFILL_BATCH_SIZE` | `4` | 某任务未达 diversity 阈值时一次新增的候选数。默认从 4 条初始候选直接补到 8 条。 |
 | `GENERATION_MICRO_BATCH_SIZE` | `4` | 每个 rollout wave 最多并行调度 4 个不同的活跃轨迹 step；对 4 个 TP=1 worker 是合适的起点。 |
 | `UIS1_ADVANTAGE_STD_THRESHOLD` | `0.3` | 每个任务候选 advantage 的标准差阈值；不足时触发补充 rollout。 |
 | `PATCH_THRESHOLD` | `1` | 一条 UI 轨迹最多允许一次 patch 后继续。 |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.50` | vLLM 可使用的显存比例。 |
+| `GPU_MEMORY_MONITOR_INTERVAL_SECONDS` | `1` | GPU 显存高水位监控的采样间隔（秒）。 |
+| `VALIDATION_PROGRESS_INTERVAL` | `25` | 每完成 N 个 validation batch 写一条简洁进度记录。 |
 | `VLLM_ENFORCE_EAGER` | `true` | 当前实验使用 eager 模式。 |
 
 `MAX_STEPS` 仅用于 smoke test。每次启动后，应以输出目录的 `experiment_config.json` 中实际写入的 `trainer.max_steps` 为准。例如 `ui_s1_qwen25vl_3b_android_control_rl_4gpu_fast_smoke_v2` 的实际值为 `2`，因此它会执行两个更新 step，而不是一个。
@@ -51,7 +54,7 @@
 
 例如，若本次有 4 个任务，每任务初始生成 4 条且无需补充，则会有 16 条 `rollout_progress` 和 16 条 `rollout`。这仍然只代表 16 条候选轨迹生成；`rollout` 不是第二次生成。
 
-若某任务的候选 advantage 标准差低于 0.3，框架会继续生成补充候选，直到满足阈值或达到 `MAX_ROLLOUTS_PER_TASK=8`。补充候选会增加 `rollout_progress` 数量；最终 `rollout` 仅保存被保留用于更新的候选。
+若某任务的候选 advantage 标准差低于 0.3，框架会一次生成最多 `DIVERSITY_REFILL_BATCH_SIZE=4` 条补充候选，直到满足阈值或达到 `MAX_ROLLOUTS_PER_TASK=8`。默认配置下，失败任务会从 4 条初始候选直接扩展至 8 条。候选全部完成后，框架枚举 8 选 4 的组合并保留 advantage 标准差最大的 4 条；补充候选会增加 `rollout_progress` 数量，但最终 `rollout` 仍只保存 4 条用于更新的轨迹。
 
 ## `training_progress.log` 阶段说明
 
@@ -73,6 +76,9 @@
 | `WORKERS` | 创建 Ray worker，并初始化 actor、reference、vLLM rollout engine、reward 等角色；实际模型权重初始化主要发生在此阶段。 |
 | `TRAINING_LOOP` | 训练主循环开始或结束。`planned_steps` 是本次有效的更新次数。 |
 | `CHECKPOINT_LOAD` | 尝试恢复 checkpoint。`SKIP` 表示本次没有要求恢复。 |
+| `VALIDATION` | 验证开始、进度或结束。`START` 记录总 batch 数和生成数；`PROGRESS` 每 25 个 batch 记录一次已完成数量、当前 overall reward 均值和耗时；`END` 记录总耗时与核心验证 reward。 |
+| `VALIDATION_ENGINE_SYNC` | 验证前将 actor 权重同步到 vLLM。 |
+| `VALIDATION_ENGINE_RELEASE` | 验证结束后让 vLLM sleep/offload。 |
 
 ### 每个训练更新（`STEP n`）
 
@@ -84,7 +90,7 @@
 | `ROLLOUT_WAVE` | 一个生成轮次：调度所有仍在进行的 rollout 的**当前轨迹 step**。`active_rollout_steps` 是该轮待生成的 step 数；不是任务数。 |
 | `REWARD \| SUMMARY` | 对刚完成 wave 中 UI 动作计算即时 reward 后的均值。`overall_mean` 是总奖励，另三个字段分别是格式、工具类型和动作参数准确性奖励。 |
 | `DIVERSITY \| READY` | 各任务候选 advantage 的分布已满足阈值，可开始选择训练轨迹。`task_ids`、`candidate_counts`、`diversity_std` 三个列表按相同位置对齐。 |
-| `DIVERSITY \| RETRY` | 仍有任务的 advantage 标准差不足，需要补充候选。`task_ids[i] → candidate_counts[i] → diversity_std[i]` 表示第 `i` 个任务的 ID、当前候选数与自身标准差；是否重试由每个任务自身的标准差决定，不由列表均值决定。 |
+| `DIVERSITY \| RETRY` | 仍有任务的 advantage 标准差不足，需要补充候选。`task_ids[i] → candidate_counts[i] → diversity_std[i] → refill_counts[i] → next_candidate_counts[i]` 表示第 `i` 个任务的 ID、参与本次标准差计算的候选数、自身标准差、本轮新增候选数和补充后的候选数；是否重试由每个任务自身的标准差决定，不由列表均值决定。 |
 | `ROLLOUT_ENGINE_RELEASE` | 让 vLLM sleep/offload，释放部分显存供 actor / reference 计算使用。 |
 | `OLD_LOG_PROBS` | 用当前更新前的 actor 计算采样 token 的概率。这里的“old”是 PPO 更新前的策略，不是磁盘里的旧 checkpoint。 |
 | `REF_LOG_PROBS` | 使用冻结 reference policy 计算概率，用于 KL 约束。 |
@@ -109,6 +115,14 @@ throughput = total_num_tokens / step_elapsed_s / GPU 数
 
 长 UI prompt、视觉输入、rollout 内多步动作、actor/reference 的完整前向计算和 actor 反向传播都会计入 step 时间。输出动作虽然通常较短，但平均 prompt 长度约 4,471 tokens，因此不能只根据 response 长度判断耗时。
 
+## GPU 显存高水位：`gpu_memory_peak.json`
+
+启动脚本会在每个输出目录启动独立的 `monitor_gpu_memory.py`，每秒原子更新一次 `gpu_memory_peak.json`。该文件会在训练中持续记录每张 GPU 的当前显存、历史峰值、峰值时间和总设备峰值，训练结束时写入 `finished_at`。
+
+`vllm_memory_budget_mib_per_gpu` 等于 GPU 总显存乘以 `VLLM_GPU_MEMORY_UTILIZATION`。例如 RTX 3090 的 24,576 MiB 与 `0.50` 对应 12,288 MiB（12 GiB）的 vLLM 总预算。这个数字不是纯 KV cache：模型权重、CUDA graph / runtime buffer 等也占用这部分预算；KV cache 是扣除这些部分后的剩余空间。
+
+监控的是设备级总显存，因此包含 vLLM、actor、reference 等所有训练阶段的显存。它适合寻找不会 OOM 的安全上限；不能单独作为 vLLM 纯 KV cache 的容量指标。
+
 ## 当前日志的已知边界
 
-目前 `training_progress.log` 已覆盖训练初始化、rollout、奖励、筛选、概率计算和 actor 更新。框架在训练结束后仍可能执行最终 validation；当前该 validation 的开始/结束没有单独写入 `training_progress.log`，应同时查看 `train.log` 中的 `Start validation...`。验证固定使用 `data.val_batch_size=1`，在验证集较大时可能占用明显时间。
+目前 `training_progress.log` 已覆盖训练初始化、rollout、奖励、筛选、概率计算、actor 更新和 validation。验证固定使用 `data.val_batch_size=1`，在验证集较大时可能占用明显时间；因此只记录开始、每 25 batch 的进度、结束和 vLLM 切换，不写逐样本日志。
