@@ -64,6 +64,7 @@ def test_training_progress_log_is_human_readable_and_flushed(tmp_path):
         diversity_std=[0.1234, 0.5678],
         refill_counts=[4, 0],
         next_candidate_counts=[8, 4],
+        selected_rollout_step_counts=[[1, 2, 2, 3], [1, 1, 2, 2]],
         elapsed_s=0.25,
     )
 
@@ -74,6 +75,7 @@ def test_training_progress_log_is_human_readable_and_flushed(tmp_path):
     assert "diversity_std=[0.1234,0.5678]" in line
     assert "refill_counts=[4,0]" in line
     assert "next_candidate_counts=[8,4]" in line
+    assert "selected_rollout_step_counts=[[1,2,2,3],[1,1,2,2]]" in line
     assert "elapsed_s=0.2500" in line
 
 

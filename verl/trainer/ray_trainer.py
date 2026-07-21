@@ -1245,12 +1245,20 @@ class RayPPOTrainer:
                 for key, value in event["reward"].items():
                     selected_reward_metrics[key].append(value)
         metrics.update({f"reward/{key}": value for key, value in reduce_metrics(selected_reward_metrics).items()})
+        # Keep task order aligned with candidate_counts. Each inner list has
+        # exactly ROLLOUT_N entries and reports model-generated UI action steps
+        # for the trajectories that will actually update the actor.
+        selected_rollout_step_counts = [
+            [len(state["events"]) for state in sorted(group["selected"], key=lambda state: state["rollout_id"])]
+            for group in selection_groups.values()
+        ]
         self._progress(
             "ROLLOUT",
             "END",
             elapsed_s=time.perf_counter() - rollout_started,
             selected_rollouts=len(selected_states),
             candidate_counts=[group["candidate_count"] for group in selection_groups.values()],
+            selected_rollout_step_counts=selected_rollout_step_counts,
             overall_reward_mean=ui_s1_metrics["uis1/step_reward_mean"],
             advantage_std=ui_s1_metrics["uis1/advantage_std"],
         )

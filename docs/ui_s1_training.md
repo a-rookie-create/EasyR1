@@ -87,7 +87,7 @@
 | --- | --- |
 | `STEP \| START` | 第 `n` 次权重更新开始；`tasks_per_update` 是任务数，`rollout_n` 是每任务初始候选数。 |
 | `ROLLOUT_ENGINE_SYNC` | 将当前 actor 的参数同步到 vLLM rollout engine。它是内存中的 actor → vLLM 同步，不是从磁盘重新加载模型。下一次更新后的新权重，会在下一次该阶段同步给 vLLM。 |
-| `ROLLOUT` | 本更新所有任务的候选轨迹采样与筛选的总阶段。`selected_rollouts` 是最终用于训练的轨迹数量。 |
+| `ROLLOUT` | 本更新所有任务的候选轨迹采样与筛选的总阶段。`selected_rollouts` 是最终用于训练的轨迹数量；`selected_rollout_step_counts=[[...],[...],[...],[...]]` 按任务顺序列出最终选中 rollout 的模型动作 step 数，每个内层列表有 `ROLLOUT_N` 个值。 |
 | `ROLLOUT_WAVE` | 一个生成轮次：调度所有仍在进行的 rollout 的**当前轨迹 step**。`active_rollout_steps` 是该轮待生成的 step 数；不是任务数。 |
 | `REWARD \| SUMMARY` | 对刚完成 wave 中 UI 动作计算即时 reward 后的均值。`overall_mean` 是总奖励，另三个字段分别是格式、工具类型和动作参数准确性奖励。 |
 | `DIVERSITY \| READY` | 各任务候选 advantage 的分布已满足阈值，可开始选择训练轨迹。`task_ids`、`candidate_counts`、`diversity_std` 三个列表按相同位置对齐。 |
