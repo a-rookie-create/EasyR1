@@ -1,14 +1,15 @@
 # UI-S1 半在线 GRPO 训练说明
 
-本文记录当前 EasyR1 中 UI-S1 Android Control 的训练设置、rollout 调度单位，以及 `training_progress.log` 的阅读方法。
+本文记录当前 EasyR1 中 UI-S1 AndroidControl / AMEX 的训练设置、rollout 调度单位，以及 `training_progress.log` 的阅读方法。面向人工操作的简洁命令见仓库外层的 `docker-easyR1-setup.md`。
 
 ## 当前推荐设置
 
-当前实验使用 Qwen2.5-VL-3B-Instruct、4 张 GPU，并以 LoRA 进行半在线 GRPO 训练。启动脚本是 `examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh`；默认训练参数记录在 `examples/ui_s1/train.env`。
+当前实验使用 Qwen2.5-VL-3B-Instruct、4 张 GPU，并以 LoRA 进行半在线 GRPO 训练。启动脚本是 `examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh`；默认训练参数记录在 `examples/ui_s1/train.env`。AndroidControl 5% 与 AMEX 5% 已分别验证可用 `VLLM_GPU_MEMORY_UTILIZATION=0.60` 运行 1 epoch。
 
 | 设置 | 当前值 | 含义 |
 | --- | ---: | --- |
 | `GPU_IDS` | `0,1,2,3` | 4 张可见 GPU。 |
+| `EPOCHS` | `1` | 默认训练完整的 1 个 epoch；设置 `MAX_STEPS` 时忽略该值。 |
 | `worker.rollout.tensor_parallel_size` | `1` | 每张 GPU 上各有一个独立的 TP=1 vLLM worker；它们不是一个四卡张量并行 engine。 |
 | `ROLLOUT_BATCH_SIZE` | `4` | 每次模型更新采样 4 个**任务**。 |
 | `ACTOR_GLOBAL_BATCH_SIZE` | `4` | actor 更新的全局 batch 大小。 |
@@ -18,7 +19,7 @@
 | `GENERATION_MICRO_BATCH_SIZE` | `4` | 每个 rollout wave 最多并行调度 4 个不同的活跃轨迹 step；对 4 个 TP=1 worker 是合适的起点。 |
 | `UIS1_ADVANTAGE_STD_THRESHOLD` | `0.3` | 每个任务候选 advantage 的标准差阈值；不足时触发补充 rollout。 |
 | `PATCH_THRESHOLD` | `1` | 一条 UI 轨迹最多允许一次 patch 后继续。 |
-| `VLLM_GPU_MEMORY_UTILIZATION` | `0.50` | vLLM 可使用的显存比例。 |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.60` | 当前 5% 数据集、4 GPU、1 epoch 已验证的 vLLM 显存比例。 |
 | `GPU_MEMORY_MONITOR_INTERVAL_SECONDS` | `1` | GPU 显存高水位监控的采样间隔（秒）。 |
 | `VALIDATION_PROGRESS_INTERVAL` | `25` | 每完成 N 个 validation batch 写一条简洁进度记录。 |
 | `VLLM_ENFORCE_EAGER` | `true` | 当前实验使用 eager 模式。 |
@@ -119,7 +120,7 @@ throughput = total_num_tokens / step_elapsed_s / GPU 数
 
 启动脚本会在每个输出目录启动独立的 `monitor_gpu_memory.py`，每秒原子更新一次 `gpu_memory_peak.json`。该文件会在训练中持续记录每张 GPU 的当前显存、历史峰值、峰值时间和总设备峰值，训练结束时写入 `finished_at`。
 
-`vllm_memory_budget_mib_per_gpu` 等于 GPU 总显存乘以 `VLLM_GPU_MEMORY_UTILIZATION`。例如 RTX 3090 的 24,576 MiB 与 `0.50` 对应 12,288 MiB（12 GiB）的 vLLM 总预算。这个数字不是纯 KV cache：模型权重、CUDA graph / runtime buffer 等也占用这部分预算；KV cache 是扣除这些部分后的剩余空间。
+`vllm_memory_budget_mib_per_gpu` 等于 GPU 总显存乘以 `VLLM_GPU_MEMORY_UTILIZATION`。例如 RTX 3090 的 24,576 MiB 与 `0.60` 对应 14,746 MiB（14.4 GiB）的 vLLM 总预算。这个数字不是纯 KV cache：模型权重、CUDA graph / runtime buffer 等也占用这部分预算；KV cache 是扣除这些部分后的剩余空间。
 
 监控的是设备级总显存，因此包含 vLLM、actor、reference 等所有训练阶段的显存。它适合寻找不会 OOM 的安全上限；不能单独作为 vLLM 纯 KV cache 的容量指标。
 
