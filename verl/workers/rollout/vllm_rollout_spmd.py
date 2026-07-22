@@ -76,6 +76,31 @@ def _get_model_architecture_override(model_path: str) -> Optional[dict[str, list
     return None
 
 
+def _install_vllm_sleep_synchronization() -> None:
+    """Synchronize in vLLM's GPU worker immediately before CuMem offload.
+
+    ``LLM.sleep`` is dispatched to vLLM's worker. Synchronizing only the
+    EasyR1/Ray caller does not necessarily drain that worker's CUDA stream,
+    which can make CuMem's pinned CPU backup report a delayed CUDA error.
+    """
+    try:
+        from vllm.v1.worker.gpu_worker import Worker as VLLMGPUWorker
+    except ImportError:
+        return
+
+    if getattr(VLLMGPUWorker, "_easy_r1_sleep_is_synchronized", False):
+        return
+
+    original_sleep = VLLMGPUWorker.sleep
+
+    def synchronized_sleep(worker, level: int = 1):
+        torch.cuda.synchronize(worker.device)
+        return original_sleep(worker, level=level)
+
+    VLLMGPUWorker.sleep = synchronized_sleep
+    VLLMGPUWorker._easy_r1_sleep_is_synchronized = True
+
+
 def _create_vllm_model_view(model_path: str, tokenizer_path: Optional[str]) -> str:
     """Build a lightweight local model view for vLLM's VLM processor.
 
@@ -202,6 +227,7 @@ class vLLMRollout(BaseRollout):
             if config.limit_images:
                 engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
+        _install_vllm_sleep_synchronization()
         VLLMHijack.hijack()
 
         self.inference_engine = LLM(
@@ -220,20 +246,16 @@ class vLLMRollout(BaseRollout):
             enforce_eager=config.enforce_eager,
             disable_custom_all_reduce=True,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_sleep_mode=True,
+            enable_sleep_mode=config.enable_sleep_mode,
             **lora_kwargs,
             **engine_kwargs,
         )
 
-        # Offload vllm model to reduce peak memory usage
-        # CUDA graph capture can still have asynchronous work in flight here.
-        # Sleeping the CuMem allocator immediately races that work on some
-        # driver/runtime combinations and surfaces as CUDA_ERROR_INVALID_VALUE
-        # while vLLM allocates its pinned CPU backup. Synchronize only at this
-        # initialization boundary instead of globally enabling
-        # CUDA_LAUNCH_BLOCKING, which would slow the whole training run.
-        torch.cuda.synchronize()
-        self.inference_engine.sleep(level=1)
+        # Offload vLLM model to reduce peak memory usage.  This path is
+        # optional because vLLM's CuMem CPU-backup allocator is not reliable
+        # on every CUDA driver/runtime combination.
+        if config.enable_sleep_mode:
+            self.inference_engine.sleep(level=1)
 
         sampling_kwargs = {
             "max_tokens": config.response_length,

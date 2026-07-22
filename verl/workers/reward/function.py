@@ -30,6 +30,7 @@ class RewardInput(TypedDict):
     response: str
     response_length: int
     ground_truth: str
+    coordinate_transform: object
 
 
 class RewardScore(TypedDict):
@@ -62,6 +63,7 @@ class SequentialFunctionRewardManagerMixin:
                     "response": response_str,
                     "response_length": cur_response_length,
                     "ground_truth": data.non_tensor_batch["ground_truth"][i],
+                    "coordinate_transform": data.non_tensor_batch.get("coordinate_transform", [None] * len(data))[i],
                 }
             )
             reward_tensor[i, cur_response_length - 1] = score["overall"]
@@ -89,6 +91,7 @@ class BatchFunctionRewardManagerMixin:
                     "response": response_str,
                     "response_length": cur_response_length,
                     "ground_truth": data.non_tensor_batch["ground_truth"][i],
+                    "coordinate_transform": data.non_tensor_batch.get("coordinate_transform", [None] * len(data))[i],
                 }
             )
 

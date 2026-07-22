@@ -194,12 +194,13 @@ python3 -m verl.trainer.main \
     worker.actor.model.lora.rank=64 \
     worker.actor.model.lora.alpha=32 \
     worker.actor.model.lora.target_modules=${LORA_TARGET_MODULES} \
-    worker.actor.optim.lr=1.0e-6 \
+    worker.actor.optim.lr=${ACTOR_LR} \
     worker.rollout.n=${ROLLOUT_N} \
     worker.rollout.temperature=0.9 \
     worker.rollout.top_p=0.95 \
     worker.rollout.limit_images=${HISTORY_IMAGE_LIMIT} \
     worker.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION} \
+    worker.rollout.enable_sleep_mode=${VLLM_ENABLE_SLEEP_MODE} \
     worker.rollout.tensor_parallel_size=1 \
     worker.rollout.enforce_eager=${VLLM_ENFORCE_EAGER:-false} \
     worker.rollout.max_model_len=${VLLM_MAX_MODEL_LEN} \

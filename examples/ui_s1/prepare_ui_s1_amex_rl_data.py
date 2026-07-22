@@ -30,7 +30,7 @@ def build_first_step_prompt(goal: str) -> str:
         "Previous model outputs:\n"
         "None\n\n"
         "Predict the next Android GUI action. Return <thinking></thinking> followed by "
-        "{\"name\":\"mobile_use\",\"arguments\":{...}}."
+        "<tool_call>{\"name\":\"mobile_use\",\"arguments\":{...}}</tool_call>."
     )
 
 

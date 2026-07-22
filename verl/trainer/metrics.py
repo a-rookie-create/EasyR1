@@ -24,7 +24,8 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     return {key: np.mean(value) for key, value in metrics.items()}
 
 
-def compute_length_metrics(batch: DataProto) -> dict[str, Any]:
+def get_length_metric_samples(batch: DataProto) -> dict[str, torch.Tensor]:
+    """Return one prompt/response length and clip flag for every batch item."""
     max_response_length = batch.batch["responses"].size(-1)
     max_prompt_length = batch.batch["attention_mask"].size(-1) - max_response_length
 
@@ -32,16 +33,50 @@ def compute_length_metrics(batch: DataProto) -> dict[str, Any]:
     response_length = batch.batch["attention_mask"][:, -max_response_length:].sum(-1).float()
 
     return {
+        "response_length": response_length,
+        "prompt_length": prompt_length,
+        "response_length/clip": torch.eq(response_length, max_response_length).float(),
+        "prompt_length/clip": torch.eq(prompt_length, max_prompt_length).float(),
+    }
+
+
+def reduce_length_metric_samples(metric_samples: dict[str, list[float]]) -> dict[str, Any]:
+    """Compute global length statistics from all validation samples.
+
+    This differs from reducing per-batch max/min values: validation can use a
+    batch size of one, in which case averaging those values incorrectly makes
+    mean, max, and min identical.
+    """
+    response_lengths = metric_samples["response_length"]
+    prompt_lengths = metric_samples["prompt_length"]
+    return {
+        "response_length/mean": float(np.mean(response_lengths)),
+        "response_length/max": float(np.max(response_lengths)),
+        "response_length/min": float(np.min(response_lengths)),
+        "response_length/clip_ratio": float(np.mean(metric_samples["response_length/clip"])),
+        "prompt_length/mean": float(np.mean(prompt_lengths)),
+        "prompt_length/max": float(np.max(prompt_lengths)),
+        "prompt_length/min": float(np.min(prompt_lengths)),
+        "prompt_length/clip_ratio": float(np.mean(metric_samples["prompt_length/clip"])),
+    }
+
+
+def compute_length_metrics(batch: DataProto) -> dict[str, Any]:
+    samples = get_length_metric_samples(batch)
+    response_length = samples["response_length"]
+    prompt_length = samples["prompt_length"]
+
+    return {
         # response length
         "response_length/mean": torch.mean(response_length).detach().item(),
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.eq(response_length, max_response_length).float().mean().detach().item(),
+        "response_length/clip_ratio": samples["response_length/clip"].mean().detach().item(),
         # prompt length
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.eq(prompt_length, max_prompt_length).float().mean().detach().item(),
+        "prompt_length/clip_ratio": samples["prompt_length/clip"].mean().detach().item(),
     }
 
 

@@ -3,6 +3,7 @@
 import json
 import math
 import re
+from copy import deepcopy
 from typing import Any
 
 
@@ -27,15 +28,6 @@ SYSTEM_BUTTONS = {"back", "home", "enter"}
 MODEL_RESPONSE_PATTERN = re.compile(
     r"\s*<thinking>(?P<thinking>.*?)</thinking>\s*"
     r"<tool_call>\s*(?P<tool_call>\{.*\})\s*</tool_call>\s*",
-    flags=re.DOTALL,
-)
-# The UI-S1 SFT model currently emits a mobile_use JSON object directly after
-# its thinking block (often with a list-marker dash). Accept that canonical
-# model format as well as the tagged format above, but still require a single
-# valid mobile_use object and no trailing prose.
-DIRECT_MODEL_RESPONSE_PATTERN = re.compile(
-    r"\s*<thinking>(?P<thinking>.*?)</thinking>\s*(?:-\s*)?"
-    r"(?P<tool_call>\{.*\})\s*",
     flags=re.DOTALL,
 )
 
@@ -101,10 +93,9 @@ def parse_action(text: Any, require_tool_call: bool = False) -> tuple[dict[str, 
         return None, 0.0
 
     candidates = []
-    for response_pattern in (MODEL_RESPONSE_PATTERN, DIRECT_MODEL_RESPONSE_PATTERN):
-        response_match = response_pattern.fullmatch(raw)
-        if response_match and response_match.group("thinking").strip():
-            candidates.append((response_match.group("tool_call"), 1.0, True))
+    response_match = MODEL_RESPONSE_PATTERN.fullmatch(raw)
+    if response_match and response_match.group("thinking").strip():
+        candidates.append((response_match.group("tool_call"), 1.0, True))
     if not require_tool_call:
         candidates.append((raw, 1.0, False))
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
@@ -185,6 +176,46 @@ def normalized_distance(a: tuple[float, float], b: tuple[float, float], size: tu
     return math.sqrt(dx * dx + dy * dy)
 
 
+def transform_action_coordinates(
+    action: dict[str, Any], coordinate_transform: Any, inverse: bool = False
+) -> dict[str, Any]:
+    """Scale every GUI point between raw-image and model-image coordinates.
+
+    ``inverse=True`` converts a Qwen prediction back to raw screenshot
+    coordinates.  X and Y intentionally use independent ratios: EasyR1 keeps
+    aspect ratio during pixel-budget resizing, but Qwen then aligns each axis
+    to its visual grid independently.
+    """
+    transformed = deepcopy(action)
+    if not isinstance(coordinate_transform, dict):
+        return transformed
+    try:
+        original_width = float(coordinate_transform["original_width"])
+        original_height = float(coordinate_transform["original_height"])
+        model_width = float(coordinate_transform["model_width"])
+        model_height = float(coordinate_transform["model_height"])
+        if min(original_width, original_height, model_width, model_height) <= 0:
+            return transformed
+    except (KeyError, TypeError, ValueError):
+        return transformed
+
+    scale_x = original_width / model_width if inverse else model_width / original_width
+    scale_y = original_height / model_height if inverse else model_height / original_height
+    for key in ("coordinate", "coordinate2"):
+        point = as_point(transformed.get(key))
+        if point is not None:
+            transformed[key] = [point[0] * scale_x, point[1] * scale_y]
+    return transformed
+
+
+def extract_action(response: Any, coordinate_transform: Any = None) -> dict[str, Any] | None:
+    """Parse one model response and express its coordinates in raw-image space."""
+    action, format_score = parse_action(response, require_tool_call=True)
+    if action is None or format_score != 1.0:
+        return None
+    return transform_action_coordinates(action, coordinate_transform, inverse=True)
+
+
 def score_point_action(pred: dict[str, Any], gt: dict[str, Any]) -> float:
     pred_point = point_from_action(pred)
     gt_point = point_from_action(gt)
@@ -252,13 +283,17 @@ def score_action(pred: dict[str, Any], gt: dict[str, Any]) -> float:
     return 0.0
 
 
-def score_one(response: Any, ground_truth: Any) -> dict[str, float]:
+def score_one(response: Any, ground_truth: Any, coordinate_transform: Any = None) -> dict[str, float]:
     pred, format_score = parse_action(response, require_tool_call=True)
     gt, gt_format = parse_action(ground_truth)
     if pred is None or gt is None or gt_format == 0.0:
         return {"overall": 0.0, "format": format_score, "type": 0.0, "accuracy": 0.0}
 
     type_score = 1.0 if format_score == 1.0 and normalize_text(pred.get("action")) == normalize_text(gt.get("action")) else 0.0
+    # Labels remain in raw screenshot coordinates.  Predictions are generated
+    # against Qwen's resized/aligned image, so convert only the prediction
+    # before comparing it with the untouched label.
+    pred = transform_action_coordinates(pred, coordinate_transform, inverse=True)
     action_score = score_action(pred, gt) if type_score == 1.0 else 0.0
     overall = 0.1 * format_score + 0.4 * format_score * type_score + 0.5 * format_score * type_score * action_score
     return {
@@ -272,7 +307,13 @@ def score_one(response: Any, ground_truth: Any) -> dict[str, float]:
 def compute_score(reward_inputs: list[dict[str, Any]]) -> list[dict[str, float]]:
     scores = []
     for reward_input in reward_inputs:
-        scores.append(score_one(reward_input.get("response", ""), reward_input.get("ground_truth", "")))
+        scores.append(
+            score_one(
+                reward_input.get("response", ""),
+                reward_input.get("ground_truth", ""),
+                reward_input.get("coordinate_transform"),
+            )
+        )
     return scores
 
 

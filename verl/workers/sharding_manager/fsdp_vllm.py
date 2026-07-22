@@ -48,11 +48,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         inference_engine: LLM,
         device_mesh: DeviceMesh,
         use_param_offload: bool,
+        enable_sleep_mode: bool = True,
     ):
         self.module = module
         self.inference_engine = inference_engine
         self.device_mesh = device_mesh
         self.use_param_offload = use_param_offload
+        self.enable_sleep_mode = enable_sleep_mode
         self.loaded = False
         self.is_lora = isinstance(self.module._fsdp_wrapped_module, PeftModel)
 
@@ -178,14 +180,15 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.loaded = True
 
         print_gpu_memory_usage("Before vllm wake up in sharding manager")
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["weights"])
-        else:
-            self.inference_engine.wake_up()
+        if self.enable_sleep_mode:
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["weights"])
+            else:
+                self.inference_engine.wake_up()
 
         self._sync_weight_to_vllm()
 
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+        if self.enable_sleep_mode and "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
             self.inference_engine.wake_up(tags=["kv_cache"])
 
         print_gpu_memory_usage("After vllm wake up in sharding manager")
@@ -200,10 +203,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.loaded = False
 
         print_gpu_memory_usage("Before vllm offload in sharding manager")
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
-        self.inference_engine.sleep(level=1)
-        free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
-        self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        if self.enable_sleep_mode:
+            free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+            self.inference_engine.sleep(level=1)
+            free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
+            self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+        else:
+            self.freed_bytes = 0
         print_gpu_memory_usage("After vllm offload in sharding manager")
 
         self.module.train()

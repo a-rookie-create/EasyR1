@@ -439,6 +439,7 @@ class FSDPWorker(Worker):
             inference_engine=self.rollout.inference_engine,
             device_mesh=rollout_device_mesh,
             use_param_offload=self._use_param_offload,
+            enable_sleep_mode=self.config.rollout.enable_sleep_mode,
         )
         print_gpu_memory_usage("After vllm init")
 

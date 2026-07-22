@@ -77,6 +77,71 @@ def process_image(
     return image
 
 
+def get_image_size(image: Union[dict[str, Any], ImageObject, str, bytes]) -> tuple[int, int]:
+    """Return an image's unscaled width and height without retaining an open file."""
+    if isinstance(image, str):
+        with Image.open(image) as opened_image:
+            return opened_image.size
+    if isinstance(image, dict):
+        with Image.open(BytesIO(image["bytes"])) as opened_image:
+            return opened_image.size
+    if isinstance(image, bytes):
+        with Image.open(BytesIO(image)) as opened_image:
+            return opened_image.size
+    return image.size
+
+
+def qwen_coordinate_transform(
+    original_size: tuple[int, int], image_grid_thw: Any, image_processor: Any
+) -> dict[str, float] | None:
+    """Describe the raw-image to Qwen visual-coordinate transform.
+
+    ``image_grid_thw`` is generated after Qwen's smart-resize/alignment.  Its
+    grid cells are ``patch_size`` pixels, so it gives the exact image size used
+    by the model instead of an approximation based only on ``max_pixels``.
+    """
+    if image_grid_thw is None:
+        return None
+    try:
+        grid = image_grid_thw.tolist() if hasattr(image_grid_thw, "tolist") else image_grid_thw
+        if isinstance(grid, (list, tuple)) and len(grid) == 1 and isinstance(grid[0], (list, tuple)):
+            grid = grid[0]
+        patch_size = float(getattr(image_processor, "patch_size"))
+        original_width, original_height = (float(original_size[0]), float(original_size[1]))
+        model_height = float(grid[1]) * patch_size
+        model_width = float(grid[2]) * patch_size
+        if min(original_width, original_height, model_width, model_height) <= 0:
+            return None
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+    return {
+        "original_width": original_width,
+        "original_height": original_height,
+        "model_width": model_width,
+        "model_height": model_height,
+        "scale_x": model_width / original_width,
+        "scale_y": model_height / original_height,
+    }
+
+
+def qwen_coordinate_transforms(
+    original_sizes: list[tuple[int, int]], image_grid_thw: Any, image_processor: Any
+) -> list[dict[str, float] | None]:
+    """Return one raw-to-Qwen transform per input image, in input order."""
+    if image_grid_thw is None:
+        return [None] * len(original_sizes)
+    grids = image_grid_thw.tolist() if hasattr(image_grid_thw, "tolist") else image_grid_thw
+    if len(grids) != len(original_sizes):
+        raise ValueError(
+            f"Qwen produced {len(grids)} image grids for {len(original_sizes)} input images; cannot align coordinates."
+        )
+    return [
+        qwen_coordinate_transform(original_size, grid, image_processor)
+        for original_size, grid in zip(original_sizes, grids, strict=True)
+    ]
+
+
 def process_video(
     video: str,
     min_pixels: Optional[int],
@@ -192,6 +257,7 @@ class RLHFDataset(Dataset):
             if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
                 images = [os.path.join(self.image_dir, image) for image in images]
 
+            original_sizes = [get_image_size(image) for image in images]
             processed_images = [] if len(images) != 0 else None  # text-only data
             for image in images:
                 processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
@@ -230,6 +296,11 @@ class RLHFDataset(Dataset):
             if self.image_dir is not None and len(images) != 0 and isinstance(images[0], str):  # image paths
                 images = [os.path.join(self.image_dir, image) for image in images]
 
+            # Keep raw sizes before ``process_image`` applies Qwen's smart
+            # resize.  These must be computed in ``__getitem__`` (not only
+            # during the optional pre-filter pass), because DataLoader worker
+            # processes execute this method independently.
+            original_sizes = [get_image_size(image) for image in images]
             processed_images = [] if len(images) != 0 else None  # text-only data
             for image in images:
                 processed_images.append(process_image(image, self.min_pixels, self.max_pixels))
@@ -238,6 +309,18 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
             example["multi_modal_data"] = {"images": images}
+            if (
+                original_sizes
+                and self.processor is not None
+                and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
+            ):
+                # An action describes the most recent screenshot in a multi-image
+                # GUI history, hence the final image/grid pair is the relevant one.
+                image_coordinate_transforms = qwen_coordinate_transforms(
+                    original_sizes, model_inputs.get("image_grid_thw", None), self.processor.image_processor
+                )
+                example["image_coordinate_transforms"] = image_coordinate_transforms
+                example["coordinate_transform"] = image_coordinate_transforms[-1]
         elif self.video_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             videos = example.pop(self.video_key)

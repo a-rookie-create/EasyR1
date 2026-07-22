@@ -41,7 +41,7 @@ from ..single_controller.base import Worker
 from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
-from ..utils.dataset import process_image
+from ..utils.dataset import get_image_size, process_image, qwen_coordinate_transforms
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
 from ..utils.logger import Tracker, TrainingProgressLogger
 from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
@@ -62,6 +62,8 @@ from .metrics import (
     compute_length_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    get_length_metric_samples,
+    reduce_length_metric_samples,
     reduce_metrics,
 )
 
@@ -160,30 +162,36 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
     return data
 
 
-def _tool_call_from_action(action: str) -> str:
-    try:
-        parsed = json.loads(action)
-    except Exception:
-        return action
-    if not isinstance(parsed, dict):
-        return action
-    if parsed.get("name") == "mobile_use" and isinstance(parsed.get("arguments"), dict):
-        parsed = parsed["arguments"]
-    if not isinstance(parsed, dict) or "action" not in parsed:
-        return action
-    # Some legacy trajectory JSONL files use a fixed action schema and retain
-    # irrelevant keys as null. They are not part of the mobile_use schema and
-    # would otherwise be copied into patched rollout history.
-    parsed = {key: value for key, value in parsed.items() if value is not None}
-    tool_call = {"name": "mobile_use", "arguments": parsed}
-    return f"<tool_call>\n{json.dumps(tool_call, ensure_ascii=False, separators=(',', ':'))}\n</tool_call>"
-
-
 def _compact_ui_action(action: Any) -> Any:
     """Drop legacy null placeholders before using an expert action as reward GT."""
     if not isinstance(action, dict):
         return action
     return {key: value for key, value in action.items() if value is not None}
+
+
+def _json_log_default(value: Any) -> Any:
+    """Convert tensor/array values retained in rollout audit records."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _as_object_array(values: list[Any]) -> np.ndarray:
+    """Keep one Python value per rollout row, even when nested lengths match.
+
+    ``np.array(values, dtype=object)`` still creates a 2-D object array when
+    every nested list in a rollout wave has the same length. In UI-S1 that
+    length is the retained image-history size, so different trajectory steps
+    later fail to concatenate. Preallocating a one-dimensional object array
+    preserves each nested value as a single row item.
+    """
+    result = np.empty(len(values), dtype=object)
+    result[:] = values
+    return result
 
 
 def _select_most_diverse_rollout_subset(
@@ -212,17 +220,12 @@ def _select_most_diverse_rollout_subset(
     return list(best_subset), best_std
 
 
-def _format_model_response_for_history(response: str, fallback_action: str) -> str:
-    raw_response = (response or "").strip()
-    tool_call = re.search(r"<tool_call>\s*(\{.*\})\s*</tool_call>", raw_response, flags=re.DOTALL)
-    if tool_call:
-        try:
-            parsed = json.loads(tool_call.group(1))
-            if parsed.get("name") == "mobile_use" and isinstance(parsed.get("arguments"), dict):
-                return raw_response
-        except Exception:
-            pass
-    return _tool_call_from_action(fallback_action)
+def _thinking_for_history(response: str) -> str | None:
+    """Keep rollout reasoning but deliberately discard every predicted action."""
+    match = re.search(r"<thinking>\s*(.*?)\s*</thinking>", response or "", flags=re.DOTALL)
+    if not match or not match.group(1).strip():
+        return None
+    return f"<thinking>\n{match.group(1).strip()}\n</thinking>"
 
 
 def _history_text(history: list[str]) -> str:
@@ -236,12 +239,19 @@ def _build_semi_online_prompt(
 ) -> str:
     if image_count < 1:
         raise ValueError(f"semi-online prompts require at least one image, got {image_count}")
+    screenshot_context = []
+    for image_index in range(image_count):
+        label = "Current screenshot (use this image to choose the next action)" if image_index == image_count - 1 else (
+            f"Previous screenshot {image_index + 1} (chronological context only)"
+        )
+        screenshot_context.append(f"{label}:\n<image>")
     content = (
-        "<image>\n" * image_count
-        + f"Goal: {goal.strip()}\n\n"
-        "Previous model outputs:\n"
+        "\n".join(screenshot_context)
+        + f"\n\nGoal: {goal.strip()}\n\n"
+        "Previous model reasoning (actions deliberately omitted):\n"
         f"{_history_text(history)}\n\n"
-        "Predict the next Android GUI action using the required thinking and mobile_use JSON format."
+        "Predict the next Android GUI action. Return exactly <thinking>...</thinking> followed by "
+        "<tool_call>{\"name\":\"mobile_use\",\"arguments\":{...}}</tool_call>."
     )
     if format_prompt:
         return Template(format_prompt.strip()).render(content=content)
@@ -408,7 +418,7 @@ class RayPPOTrainer:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         with open(log_path, "a", encoding="utf-8") as handle:
             for entry in entries:
-                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                handle.write(json.dumps(entry, ensure_ascii=False, default=_json_log_default) + "\n")
             # Keep the records observable by `tail -f` without waiting for a
             # training step or the Python process to exit.
             handle.flush()
@@ -684,8 +694,10 @@ class RayPPOTrainer:
             for key, value in reward_metrics.items():
                 reward_metrics_lst[key].extend(value)
 
-            for key, value in compute_length_metrics(test_batch).items():
-                length_metrics_lst[key].append(value)
+            # Collect individual lengths across the complete validation set.
+            # Reducing batch-level max/min is wrong when val_batch_size=1.
+            for key, values in get_length_metric_samples(test_batch).items():
+                length_metrics_lst[key].extend(values.detach().cpu().tolist())
 
             if batch_index % progress_interval == 0 or batch_index == total_batches:
                 overall_rewards = reward_metrics_lst.get("overall", [])
@@ -706,7 +718,9 @@ class RayPPOTrainer:
         self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
         self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
         val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
-        val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
+        val_length_metrics = {
+            f"val_{key}": value for key, value in reduce_length_metric_samples(length_metrics_lst).items()
+        }
         print("Finish validation.")
         validation_result = {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
         self._progress(
@@ -753,6 +767,7 @@ class RayPPOTrainer:
 
             raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             images = example["images"]
+            original_sizes = [get_image_size(image) for image in images]
             processed_images = [process_image(image, meta_info["min_pixels"], meta_info["max_pixels"]) for image in images]
             model_inputs = self.processor(processed_images, [raw_prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
@@ -801,9 +816,23 @@ class RayPPOTrainer:
             non_tensors["step_id"].append(example["step_id"])
             non_tensors["task_id"].append(example["task_id"])
             non_tensors["rollout_id"].append(example["rollout_id"])
+            if (
+                original_sizes
+                and self.processor is not None
+                and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
+            ):
+                image_coordinate_transforms = qwen_coordinate_transforms(
+                    original_sizes, model_inputs.get("image_grid_thw", None), self.processor.image_processor
+                )
+                coordinate_transform = image_coordinate_transforms[-1]
+            else:
+                coordinate_transform = None
+                image_coordinate_transforms = None
+            non_tensors["coordinate_transform"].append(coordinate_transform)
+            non_tensors["image_coordinate_transforms"].append(image_coordinate_transforms)
 
         tensor_batch = {key: torch.stack(value, dim=0) for key, value in tensors.items()}
-        non_tensor_batch = {key: np.array(value, dtype=object) for key, value in non_tensors.items()}
+        non_tensor_batch = {key: _as_object_array(value) for key, value in non_tensors.items()}
         return DataProto.from_dict(tensors=tensor_batch, non_tensors=non_tensor_batch, meta_info=meta_info)
 
     def _filter_grpo_groups(self, batch: DataProto) -> DataProto:
@@ -1120,6 +1149,10 @@ class RayPPOTrainer:
                     response_len = int(response_lengths[row_idx].item())
                     response_ids = step_batch.batch["responses"][row_idx][:response_len]
                     response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                    coordinate_transform = step_batch.non_tensor_batch["coordinate_transform"][row_idx]
+                    from examples.ui_s1.reward_ui_s1_step import extract_action
+
+                    extracted_action = extract_action(response_text, coordinate_transform)
                     accuracy = reward_metrics.get("accuracy", [0.0] * len(examples))[row_idx]
                     matched = float(accuracy) >= 1.0
                     extract_match.append(matched)
@@ -1127,13 +1160,17 @@ class RayPPOTrainer:
                     termination_reason = None
 
                     if matched:
-                        state["history"].append(_format_model_response_for_history(response_text, gt_action))
+                        thinking = _thinking_for_history(response_text)
+                        if thinking is not None:
+                            state["history"].append(thinking)
                         state["step_pos"] += 1
                     else:
                         patch_threshold = self.config.algorithm.patch_threshold
                         can_patch = patch_threshold == -1 or state["patch_count"] < patch_threshold
                         if can_patch:
-                            state["history"].append(_tool_call_from_action(gt_action))
+                            thinking = _thinking_for_history(response_text)
+                            if thinking is not None:
+                                state["history"].append(thinking)
                             state["patch_count"] += 1
                             state["step_pos"] += 1
                             patched = True
@@ -1147,6 +1184,9 @@ class RayPPOTrainer:
                             "images": example["images"],
                             "expert_action": json.loads(gt_action),
                             "model_response": response_text,
+                            "extracted_action": extracted_action,
+                            "coordinate_transform": coordinate_transform,
+                            "image_coordinate_transforms": step_batch.non_tensor_batch["image_coordinate_transforms"][row_idx],
                             "reward": {
                                 key: float(values[row_idx])
                                 for key, values in reward_metrics.items()
@@ -1245,20 +1285,25 @@ class RayPPOTrainer:
                 for key, value in event["reward"].items():
                     selected_reward_metrics[key].append(value)
         metrics.update({f"reward/{key}": value for key, value in reduce_metrics(selected_reward_metrics).items()})
-        # Keep task order aligned with candidate_counts. Each inner list has
-        # exactly ROLLOUT_N entries and reports model-generated UI action steps
-        # for the trajectories that will actually update the actor.
-        selected_rollout_step_counts = [
-            [len(state["events"]) for state in sorted(group["selected"], key=lambda state: state["rollout_id"])]
+        # Task -> selected rollout.  Each entry is generated action steps over
+        # the complete expert trajectory length, e.g. 2/6 means generation
+        # stopped after two of six expert steps.
+        selected_rollout_progress = "[" + ",".join(
+            "["
+            + ",".join(
+                f"{len(state['events'])}/{len(state['steps'])}"
+                for state in sorted(group["selected"], key=lambda state: state["rollout_id"])
+            )
+            + "]"
             for group in selection_groups.values()
-        ]
+        ) + "]"
         self._progress(
             "ROLLOUT",
             "END",
             elapsed_s=time.perf_counter() - rollout_started,
             selected_rollouts=len(selected_states),
             candidate_counts=[group["candidate_count"] for group in selection_groups.values()],
-            selected_rollout_step_counts=selected_rollout_step_counts,
+            selected_rollout_progress=selected_rollout_progress,
             overall_reward_mean=ui_s1_metrics["uis1/step_reward_mean"],
             advantage_std=ui_s1_metrics["uis1/advantage_std"],
         )
