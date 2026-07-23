@@ -66,13 +66,20 @@ class FileLogger(Logger):
         self.config = config
         print(f"Initializing logging file to {config['trainer']['save_checkpoint_path']}.")
         os.makedirs(config["trainer"]["save_checkpoint_path"], exist_ok=True)
-        with open(os.path.join(config["trainer"]["save_checkpoint_path"], "experiment_config.json"), "w") as f:
+        trainer_config = config["trainer"]
+        checkpoint_tracker_path = os.path.join(trainer_config["save_checkpoint_path"], "checkpoint_tracker.json")
+        self.is_resuming = trainer_config.get("load_checkpoint_path") is not None or (
+            trainer_config.get("find_last_checkpoint", False) and os.path.isfile(checkpoint_tracker_path)
+        )
+        config_filename = "experiment_config.resume.json" if self.is_resuming else "experiment_config.json"
+        with open(os.path.join(trainer_config["save_checkpoint_path"], config_filename), "w") as f:
             json.dump(config, f, indent=2)
 
-        with open(os.path.join(config["trainer"]["save_checkpoint_path"], "experiment_log.jsonl"), "w") as f:
+        log_mode = "a" if self.is_resuming else "w"
+        with open(os.path.join(trainer_config["save_checkpoint_path"], "experiment_log.jsonl"), log_mode) as f:
             pass
 
-        with open(os.path.join(config["trainer"]["save_checkpoint_path"], "generations.log"), "w") as f:
+        with open(os.path.join(trainer_config["save_checkpoint_path"], "generations.log"), log_mode) as f:
             pass
 
     def log(self, data: dict[str, Any], step: int) -> None:

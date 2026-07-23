@@ -181,6 +181,18 @@ def test_training_progress_log_is_human_readable_and_flushed(tmp_path):
     assert "elapsed_s=0.2500" in line
 
 
+def test_training_progress_log_appends_on_resume(tmp_path):
+    path = tmp_path / "training_progress.log"
+    path.write_text("prior training milestone\n", encoding="utf-8")
+
+    progress = TrainingProgressLogger(str(path), append=True)
+    progress.log("RUN", "RESUME")
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "prior training milestone"
+    assert "RUN | RESUME" in lines[1]
+
+
 def test_rollout_audit_log_serializes_numpy_coordinate_transforms(tmp_path):
     trainer = object.__new__(RayPPOTrainer)
     rollout_log_path = tmp_path / "semi_online_rollouts.jsonl"
@@ -227,3 +239,23 @@ def test_epoch_checkpoint_cadence_and_rollout_trace(tmp_path):
     assert record["candidate_attempt"] == 2
     assert record["selected_batch"]
     assert record["events"][0]["patch_applied"]
+
+
+def test_time_checkpoint_cadence_is_checked_after_completed_saves(monkeypatch):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.config = SimpleNamespace(
+        trainer=SimpleNamespace(save_freq=-1, save_every_n_epochs=0, save_interval_seconds=60.0)
+    )
+    trainer.steps_per_epoch = 5
+    trainer.global_step = 3
+    trainer._last_checkpoint_step = -1
+    trainer._last_checkpoint_monotonic = 100.0
+
+    monkeypatch.setattr("verl.trainer.ray_trainer.time.monotonic", lambda: 159.9)
+    assert not trainer._should_save_checkpoint()
+
+    monkeypatch.setattr("verl.trainer.ray_trainer.time.monotonic", lambda: 160.0)
+    assert trainer._should_save_checkpoint()
+    trainer._record_checkpoint_saved()
+    assert trainer._last_checkpoint_step == 3
+    assert not trainer._should_save_checkpoint()

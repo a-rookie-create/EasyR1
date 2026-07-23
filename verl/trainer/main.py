@@ -37,10 +37,14 @@ class Runner:
     def run(self, config: PPOConfig):
         # print config
         print(json.dumps(config.to_dict(), indent=2))
-        progress_logger = TrainingProgressLogger(config.trainer.progress_log_path)
+        checkpoint_tracker_path = os.path.join(config.trainer.save_checkpoint_path, "checkpoint_tracker.json")
+        is_resuming = config.trainer.load_checkpoint_path is not None or (
+            config.trainer.find_last_checkpoint and os.path.isfile(checkpoint_tracker_path)
+        )
+        progress_logger = TrainingProgressLogger(config.trainer.progress_log_path, append=is_resuming)
         progress_logger.log(
             "RUN",
-            "START",
+            "RESUME" if is_resuming else "START",
             experiment=config.trainer.experiment_name,
             gpus_per_node=config.trainer.n_gpus_per_node,
             nodes=config.trainer.nnodes,

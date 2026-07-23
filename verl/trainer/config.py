@@ -148,6 +148,8 @@ class TrainerConfig:
     """save frequency, -1 means no saving"""
     save_every_n_epochs: int = 0
     """save at each N completed epochs; 0 disables epoch-based checkpointing"""
+    save_interval_seconds: float = 0.0
+    """save after a completed update when this many seconds have elapsed; 0 disables time-based saving"""
     save_limit: int = -1
     """max number of checkpoints to save, -1 means no limit"""
     save_model_only: bool = False
@@ -168,6 +170,8 @@ class TrainerConfig:
     """automatically find the last checkpoint in the save checkpoint path to resume training"""
 
     def post_init(self):
+        if self.save_interval_seconds < 0:
+            raise ValueError("trainer.save_interval_seconds must be non-negative.")
         if self.save_checkpoint_path is None:
             self.save_checkpoint_path = os.path.join("checkpoints", self.project_name, self.experiment_name)
 

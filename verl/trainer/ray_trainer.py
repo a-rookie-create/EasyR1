@@ -401,6 +401,17 @@ class RayPPOTrainer:
             progress_logger.log(phase, status, step=getattr(self, "global_step", None), **fields)
 
     def _should_save_checkpoint(self) -> bool:
+        # A time-based checkpoint is deliberately checked only after the actor
+        # update has finished. This guarantees that every periodic checkpoint
+        # contains the most recently updated policy instead of a half-finished
+        # optimization step. The interval is measured between completed saves.
+        interval_seconds = getattr(self.config.trainer, "save_interval_seconds", 0.0)
+        last_checkpoint_at = getattr(self, "_last_checkpoint_monotonic", None)
+        by_time = (
+            interval_seconds > 0
+            and last_checkpoint_at is not None
+            and time.monotonic() - last_checkpoint_at >= interval_seconds
+        )
         by_step = self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0
         epoch_interval = self.config.trainer.save_every_n_epochs
         by_epoch = (
@@ -408,7 +419,13 @@ class RayPPOTrainer:
             and self.steps_per_epoch > 0
             and self.global_step % (self.steps_per_epoch * epoch_interval) == 0
         )
-        return by_step or by_epoch
+        checkpoint_already_saved = getattr(self, "_last_checkpoint_step", None) == self.global_step
+        return not checkpoint_already_saved and (by_time or by_step or by_epoch)
+
+    def _record_checkpoint_saved(self) -> None:
+        """Record the completed save so time-based cadence starts after I/O."""
+        self._last_checkpoint_step = self.global_step
+        self._last_checkpoint_monotonic = time.monotonic()
 
     def _append_semi_online_rollout_log_entries(self, entries: list[dict[str, Any]]) -> None:
         """Append visible JSONL records while semi-online generation is still running."""
@@ -1419,6 +1436,10 @@ class RayPPOTrainer:
         # load checkpoint before doing anything
         self._load_checkpoint()
         main_tqdm.update(self.global_step)
+        # Resuming begins a fresh wall-clock interval. Checkpoint I/O and model
+        # restoration should not make the first resumed update save immediately.
+        self._last_checkpoint_step = -1
+        self._last_checkpoint_monotonic = time.monotonic()
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1588,6 +1609,7 @@ class RayPPOTrainer:
                     self._progress("CHECKPOINT_SAVE", "START")
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
+                    self._record_checkpoint_saved()
                     self._progress("CHECKPOINT_SAVE", "END", elapsed_s=timing_raw["save_checkpoint"])
 
             # collect metrics
@@ -1625,5 +1647,6 @@ class RayPPOTrainer:
             final_checkpoint_started = time.perf_counter()
             self._progress("CHECKPOINT_SAVE", "START", final=True)
             self._save_checkpoint()
+            self._record_checkpoint_saved()
             self._progress("CHECKPOINT_SAVE", "END", final=True, elapsed_s=time.perf_counter() - final_checkpoint_started)
         self._progress("TRAINING_LOOP", "END", completed_steps=self.global_step)

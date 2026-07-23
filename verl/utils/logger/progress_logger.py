@@ -11,12 +11,13 @@ from typing import Any, Optional
 class TrainingProgressLogger:
     """Write concise, human-readable training milestones that are safe to tail."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, append: bool = False) -> None:
         self.path = os.path.abspath(path)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        # A run directory is required to be new by the UI-S1 launcher, so a
-        # fresh progress file cannot discard another run's information.
-        with open(self.path, "w", encoding="utf-8"):
+        # A resumed run must retain the prior milestones. Opening once here
+        # still creates a fresh file for new runs, while append mode leaves a
+        # complete pre-interruption history available to tail and audit.
+        with open(self.path, "a" if append else "w", encoding="utf-8"):
             pass
 
     @staticmethod
@@ -43,4 +44,3 @@ class TrainingProgressLogger:
         with open(self.path, "a", encoding="utf-8", buffering=1) as handle:
             handle.write(" | ".join(parts) + "\n")
             handle.flush()
-

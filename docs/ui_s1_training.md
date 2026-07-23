@@ -26,6 +26,27 @@
 
 `MAX_STEPS` 仅用于 smoke test。每次启动后，应以输出目录的 `experiment_config.json` 中实际写入的 `trainer.max_steps` 为准。例如 `ui_s1_qwen25vl_3b_android_control_rl_4gpu_fast_smoke_v2` 的实际值为 `2`，因此它会执行两个更新 step，而不是一个。
 
+## 定时 checkpoint 与断点续训
+
+checkpoint 是完整训练状态：actor 的 FSDP/LoRA 权重、优化器、学习率调度器、各 rank 的随机数状态及 stateful dataloader 状态都会写入 `RUN_DIR/global_step_<N>/`。因此恢复不会只加载 actor 权重，也不会重新从数据集开头开始。
+
+在启动命令中设置 `SAVE_INTERVAL_SECONDS=X`（单位：秒）即可开启定时保存，例如 `SAVE_INTERVAL_SECONDS=1800` 表示每 30 分钟保存一次。计时到期后，框架会等当前 update 的 actor 更新完成才保存，所以 checkpoint 始终对应一个完整的最新 actor step；训练结束时也会额外保存最后一步。`SAVE_LIMIT=-1` 默认保留全部断点；设为正整数可限制保留数量。
+
+要从最新断点继续，使用原来的 `RUN_NAME` 并增加 `RESUME=true`。启动脚本会读取 `RUN_DIR/checkpoint_tracker.json` 指向的最后一个完整 `global_step_*`，并恢复训练状态：
+
+`EPOCHS` / `MAX_STEPS` 要设为希望达到的总更新量，而不是“额外训练量”。例如：
+
+```bash
+RUN_NAME=ui_s1_qwen25vl_3b_amex_5pct_4gpu_1epoch_v1 \
+RESUME=true \
+SAVE_INTERVAL_SECONDS=1800 \
+bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
+```
+
+若 checkpoint 不在该 run 目录下，可额外指定 `RESUME_CHECKPOINT_PATH=/absolute/path/to/global_step_N`。恢复时不应使用 `trainer.save_model_only=true`，否则优化器等训练状态不存在；本启动脚本固定使用完整 checkpoint。
+
+恢复时 `training_progress.log`、`train.log`、`experiment_log.jsonl` 和 `generations.log` 都会追加写入，不会清空中断前的内容。进度日志会以 `RUN | RESUME` 开始新的一段，并在随后出现 `CHECKPOINT_LOAD | START/END`；其中 `END` 的 step 就是恢复的 checkpoint step，下一次训练更新从该 step 加一开始。
+
 ## 必须区分的三个层级
 
 ```text

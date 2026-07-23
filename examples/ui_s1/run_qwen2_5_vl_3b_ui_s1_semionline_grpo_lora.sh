@@ -52,16 +52,47 @@ done
 DATASET_LABEL=${DATASET_LABEL:-${DATASET}}
 RUN_NAME=${RUN_NAME:-ui_s1_qwen25vl_3b_${DATASET_LABEL}_semionline_grpo_lora_$(date +%Y%m%d_%H%M%S)}
 RUN_DIR=${OUTPUT_ROOT}/${RUN_NAME}
+RESUME=${RESUME:-false}
+RESUME_CHECKPOINT_PATH=${RESUME_CHECKPOINT_PATH:-}
 
 TRAINER_MAX_STEPS_ARG=()
 if [[ -n "${MAX_STEPS}" ]]; then
     TRAINER_MAX_STEPS_ARG=("trainer.max_steps=${MAX_STEPS}")
 fi
 
+case "${RESUME}" in
+    true|false) ;;
+    *) echo "RESUME must be true or false, got ${RESUME}." >&2; exit 2 ;;
+esac
+
+TRAINER_RESUME_ARGS=()
 if [[ -e "${RUN_DIR}" ]]; then
-    echo "Refusing to reuse existing run directory: ${RUN_DIR}" >&2
-    echo "Set RUN_NAME to a new value so checkpoints and rollout logs cannot be mixed." >&2
+    if [[ "${RESUME}" != "true" ]]; then
+        echo "Refusing to reuse existing run directory: ${RUN_DIR}" >&2
+        echo "Set RESUME=true to restore its latest checkpoint, or set RUN_NAME to a new value." >&2
+        exit 2
+    fi
+    if [[ ! -d "${RUN_DIR}" ]]; then
+        echo "RUN_DIR exists but is not a directory: ${RUN_DIR}" >&2
+        exit 2
+    fi
+    if [[ -z "${RESUME_CHECKPOINT_PATH}" && ! -f "${RUN_DIR}/checkpoint_tracker.json" ]]; then
+        echo "Cannot resume: ${RUN_DIR}/checkpoint_tracker.json is missing." >&2
+        echo "Set RESUME_CHECKPOINT_PATH to a complete global_step_* checkpoint if it lives elsewhere." >&2
+        exit 2
+    fi
+elif [[ "${RESUME}" == "true" && -z "${RESUME_CHECKPOINT_PATH}" ]]; then
+    echo "Cannot resume: run directory does not exist: ${RUN_DIR}" >&2
     exit 2
+fi
+
+if [[ "${RESUME}" == "true" ]]; then
+    TRAINER_RESUME_ARGS=("trainer.find_last_checkpoint=true")
+    if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
+        TRAINER_RESUME_ARGS+=("trainer.load_checkpoint_path=${RESUME_CHECKPOINT_PATH}")
+    fi
+else
+    TRAINER_RESUME_ARGS=("trainer.find_last_checkpoint=false")
 fi
 mkdir -p "${RUN_DIR}"
 RUN_LOG=${RUN_LOG:-${RUN_DIR}/train.log}
@@ -84,6 +115,10 @@ is_nonnegative_integer() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+is_nonnegative_number() {
+    [[ "$1" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
+}
+
 is_positive_integer "${N_GPUS_PER_NODE}" || {
     echo "N_GPUS_PER_NODE must be a positive integer, got ${N_GPUS_PER_NODE}." >&2
     exit 2
@@ -102,6 +137,10 @@ is_positive_integer "${DIVERSITY_REFILL_BATCH_SIZE}" || {
 }
 is_positive_integer "${VALIDATION_PROGRESS_INTERVAL}" || {
     echo "VALIDATION_PROGRESS_INTERVAL must be a positive integer, got ${VALIDATION_PROGRESS_INTERVAL}." >&2
+    exit 2
+}
+is_nonnegative_number "${SAVE_INTERVAL_SECONDS}" || {
+    echo "SAVE_INTERVAL_SECONDS must be a non-negative number, got ${SAVE_INTERVAL_SECONDS}." >&2
     exit 2
 }
 if (( MAX_ROLLOUTS_PER_TASK < ROLLOUT_N )); then
@@ -217,10 +256,11 @@ python3 -m verl.trainer.main \
     trainer.val_freq=-1 \
     trainer.save_freq=-1 \
     trainer.save_every_n_epochs=${SAVE_EVERY_N_EPOCHS} \
-    trainer.save_limit=-1 \
+    trainer.save_interval_seconds=${SAVE_INTERVAL_SECONDS} \
+    trainer.save_limit=${SAVE_LIMIT} \
     trainer.save_model_only=false \
     trainer.save_checkpoint_path=${RUN_DIR} \
     trainer.rollout_log_path=${RUN_DIR}/semi_online_rollouts.jsonl \
     trainer.progress_log_path=${RUN_DIR}/training_progress.log \
     trainer.progress_validation_interval=${VALIDATION_PROGRESS_INTERVAL} \
-    trainer.find_last_checkpoint=false
+    "${TRAINER_RESUME_ARGS[@]}"
