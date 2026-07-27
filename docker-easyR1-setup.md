@@ -108,11 +108,12 @@ bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-## 5. AMEX 全数据集：1 epoch、2 GPU
+## 5. AMEX 全数据集：Patch 模仿学习、1 epoch、2 GPU
 
 ```bash
 docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
-GPU_IDS=0,1 \
+# 当前 v3 的实际续训命令。仅在该 run 已停止时执行；运行中不要重复执行。
+GPU_IDS=0,2 \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 DATASET=amex \
@@ -133,17 +134,46 @@ VLLM_ENFORCE_EAGER=true \
 VLLM_ENABLE_SLEEP_MODE=true \
 GPU_MEMORY_MONITOR_INTERVAL_SECONDS=1 \
 VALIDATION_PROGRESS_INTERVAL=25 \
-SAVE_INTERVAL_SECONDS=7200 \
+PATCH_IMITATION_ENABLED=true \
+PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
+PATCH_IMITATION_LAMBDA_DECAY=0.994 \
+PATCH_IMITATION_LAMBDA_MIN=0.0 \
+PATCH_IMITATION_TARGET_MODE=action_only \
+PATCH_HISTORY_MODE=keep_model_thinking \
+SAVE_EVERY_N_EPOCHS=1 \
+SAVE_INTERVAL_SECONDS=18000 \
 SAVE_LIMIT=-1 \
-RESUME=false \
-RUN_NAME=ui_s1_qwen25vl_3b_amex_2gpu_1epoch_v1 \
+RESUME=true \
+RUN_NAME=ui_s1_qwen25vl_3b_amex_2gpu_patch_1epoch_v3 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-开始一项新训练时必须使用未存在的 `RUN_NAME`，例如将末尾 `v1` 改为 `v2`；训练脚本会拒绝覆盖已有输出目录。意外中断后，保留原 `RUN_NAME` 并增加 `RESUME=true`，即可从最新 checkpoint 继续。
+该命令从 `checkpoint_tracker.json` 所指向的最新完整 checkpoint 恢复；当前设置将时间保存间隔从 2 小时改为 5 小时。停机等待时间不计入保存间隔，恢复完成后重新计时。开始一项新训练时必须使用未存在的 `RUN_NAME`、设置 `RESUME=false`，并保留同样的 Patch 模仿参数。
 
-断点续训必须保持保存时的 GPU 数。本机已有的旧 run 是四卡 FSDP 分片，不能直接用 `GPU_IDS=0,1` 恢复；新的两卡 run 可继续用两卡恢复。脚本会在模型初始化前拒绝不匹配或不完整的 checkpoint。
+### 断点续训：参数变更边界
+
+下表中的“可修改”指在不改变已保存模型/优化器状态的前提下可以修改；“不可修改”是代码会明确拒绝，或会使续训不再是同一训练实验。
+
+| 分类 | 参数 | 续训时是否可修改 | 依据与限制 |
+|---|---|---|---|
+| 原地续训时保持 | `RUN_NAME`、`OUTPUT_ROOT` | 否 | 要续写原 run 的日志与 checkpoint，必须定位到原 run 目录及其 `checkpoint_tracker.json`；改路径并显式给出 `RESUME_CHECKPOINT_PATH` 属于从该 checkpoint 派生新 run。 |
+| 必须保持 | `RESUME` | 必须为 `true` | 现有输出目录配合 `RESUME=false` 会被启动脚本拒绝。 |
+| 代码明确校验 | GPU 数量 / FSDP world size | 否 | 必须与 checkpoint 的 actor 分片 world size 相同；当前为 2。缺少 `model`、`optim`、`extra_state` 分片或 `dataloader.pt` 也会拒绝恢复。 |
+| 可修改 | `GPU_IDS` 的具体编号 | 是 | 可由 `0,1` 改为当前的 `0,2`；前提是设备数量仍为 2、CUDA 环境兼容且显存足够。 |
+| 代码明确校验 | `PATCH_IMITATION_ENABLED` | 否 | 必须与 checkpoint 保存的开关一致。 |
+| 代码明确校验 | `PATCH_IMITATION_LAMBDA_INITIAL`、`LAMBDA_DECAY`、`LAMBDA_MIN` | 否 | 必须与 checkpoint 一致，保证后续 \(\lambda_t\) 连续。 |
+| 代码明确校验 | `PATCH_IMITATION_TARGET_MODE`、`PATCH_HISTORY_MODE` | 否 | 必须与 checkpoint 一致。 |
+| 应保持不变 | 模型/Tokenizer 路径、LoRA rank/alpha/target modules、FSDP 结构 | 否 | 虽非每项都单独比较，但 checkpoint 的模型与优化器状态依赖相同参数拓扑；改动可能加载失败或破坏实验连续性。 |
+| 应保持不变 | 数据集文件、shuffle/seed、batch size、`ROLLOUT_N`、数据长度 | 否 | checkpoint 保存并恢复 dataloader cursor；改动数据或批处理结构会使后续样本序列和训练语义不连续。 |
+| 应保持不变 | reward、GRPO/UI-S1 参数、KL、actor LR、rollout 温度/采样参数、`PATCH_THRESHOLD` | 否 | 代码不会逐项阻止，但它们会改变后续优化目标、奖励、轨迹分布或更新尺度；应新建 run 做消融。 |
+| 可修改 | `SAVE_INTERVAL_SECONDS` | 是 | 只控制恢复后下一次时间保存；当前从 `7200` 改为 `18000` 秒。 |
+| 可修改 | `SAVE_LIMIT`、`SAVE_EVERY_N_EPOCHS` | 是 | 只影响后续 checkpoint 保留与保存频率。 |
+| 可修改 | `GPU_MEMORY_MONITOR_INTERVAL_SECONDS`、`VALIDATION_PROGRESS_INTERVAL`、logger、Ray dashboard | 是 | 只影响监控或日志。 |
+| 条件可修改 | `EPOCHS` / `MAX_STEPS` | 可以延长，不应缩短到当前 step 以下 | 用于明确延长训练总步数；会形成新的训练阶段，应在实验记录中注明。 |
+| 条件可修改 | `RESUME_CHECKPOINT_PATH` | 是 | 可指定同一兼容 run 的较早完整 `global_step_<n>` checkpoint，用于回退；仍受 world size、Patch 配置和完整性校验。 |
+
+时间 checkpoint 只会在一个完整 actor update 后检查。当前 `save_freq=-1`，因此没有“每 N step 保存”；另有 `SAVE_EVERY_N_EPOCHS=1` 的 epoch 末保存和训练正常结束时的兜底保存。
 
 ## 6. 查看运行状态与结果
 
