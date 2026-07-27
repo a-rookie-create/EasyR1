@@ -13,7 +13,7 @@ nvidia-smi
 首次在新服务器配置运行时路径：
 
 ```bash
-cd /data5/zst/biye210
+cd /home/zst/biye215
 cp EasyR1/examples/ui_s1/runtime.env.example EasyR1/examples/ui_s1/runtime.env
 # 编辑 EasyR1/examples/ui_s1/runtime.env，填写 PROJECT_ROOT、OUTPUT_ROOT、RAY 等服务器路径。
 ```
@@ -27,31 +27,31 @@ docker run -d \
   --ipc=host \
   --shm-size=32g \
   -p 8265:8265 \
-  -v /data5/zst/biye210:/data5/zst/biye210 \
-  -w /data5/zst/biye210/EasyR1 \
+  -v /home/zst/biye215:/home/zst/biye215 \
+  -w /home/zst/biye215/EasyR1 \
   hiyouga/verl:ngc-th2.8.0-cu12.9-vllm0.11.0 \
   sleep infinity
 
 docker exec easyr1 python3 -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
-预期最后一条输出为 `True 4`。
+预期第一项为 `True`，且设备数不少于 2；正式训练仍由 `GPU_IDS=0,1` 只选择两张卡。
 
 ## 2. 生成 5% RL 数据（首次或数据变更后）
 
 ```bash
-cd /data5/zst/biye210/EasyR1
+cd /home/zst/biye215/EasyR1
 set -a; source examples/ui_s1/runtime.env; set +a
 
 python3 -B examples/ui_s1/prepare_ui_s1_android_control_rl_data.py \
-  --android-control-dir /data5/zst/biye210/datasets/android_control \
-  --image-dir /data5/zst/biye210/llamafactory/data/ui_s1_android_control_sft/images \
-  --output-dir /data5/zst/biye210/EasyR1/datasets/android_control_5pct \
+  --android-control-dir /home/zst/biye215/datasets/android_control \
+  --image-dir /home/zst/biye215/llamafactory/data/ui_s1_android_control_sft/images \
+  --output-dir /home/zst/biye215/EasyR1/datasets/android_control_5pct \
   --sample-ratio 0.05 --dataset-name android_control_5pct --seed 42
 
 python3 -B examples/ui_s1/prepare_ui_s1_amex_rl_data.py \
-  --amex-dir /data5/zst/biye210/datasets/amex \
-  --output-dir /data5/zst/biye210/EasyR1/datasets/amex_5pct \
+  --amex-dir /home/zst/biye215/datasets/amex \
+  --output-dir /home/zst/biye215/EasyR1/datasets/amex_5pct \
   --sample-ratio 0.05 --dataset-name amex_5pct --seed 42
 ```
 
@@ -60,8 +60,12 @@ python3 -B examples/ui_s1/prepare_ui_s1_amex_rl_data.py \
 ## 3. 训练前检查
 
 ```bash
-docker exec -it -w /data5/zst/biye210/EasyR1 easyr1 bash -lc '
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
 python3 -m pytest -q \
+  tests/test_patch_imitation_config.py \
+  tests/test_patch_imitation_actor.py \
+  tests/test_patch_imitation_resume.py \
+  tests/test_ui_s1_patch_imitation.py \
   tests/test_ui_s1_reward.py \
   tests/test_ui_s1_advantage.py \
   tests/test_ui_s1_rollout_support.py \
@@ -69,24 +73,26 @@ python3 -m pytest -q \
 '
 ```
 
-## 4. AndroidControl 全数据集：1 epoch、4 GPU
+## 4. AndroidControl 全数据集：1 epoch、2 GPU
+
+下面命令默认是 `PATCH_IMITATION_ENABLED=false` 的纯 GRPO 基线。运行 GRPO+Patch 主实验时，还需显式加入 `PATCH_IMITATION_ENABLED=true`、正的 `PATCH_IMITATION_LAMBDA_INITIAL`，以及选定的 decay/min；这里不替你虚构尚未确认的 lambda 数值。
 
 ```bash
-docker exec -it -w /data5/zst/biye210/EasyR1 easyr1 bash -lc '
-GPU_IDS=0,1,2,3 \
-MODEL_PATH=/data5/zst/biye210/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-TOKENIZER_PATH=/data5/zst/biye210/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
+GPU_IDS=0,1 \
+MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 DATASET=android_control \
-DATA_DIR=/data5/zst/biye210/EasyR1/datasets/android_control \
-TRAIN_FILE=/data5/zst/biye210/EasyR1/datasets/android_control/android_control_train.jsonl \
-VAL_FILE=/data5/zst/biye210/EasyR1/datasets/android_control/android_control_val.jsonl \
+DATA_DIR=/home/zst/biye215/EasyR1/datasets/android_control \
+TRAIN_FILE=/home/zst/biye215/EasyR1/datasets/android_control/android_control_train.jsonl \
+VAL_FILE=/home/zst/biye215/EasyR1/datasets/android_control/android_control_val.jsonl \
 EPOCHS=1 \
 ROLLOUT_BATCH_SIZE=4 \
 ACTOR_GLOBAL_BATCH_SIZE=4 \
 ROLLOUT_N=4 \
 MAX_ROLLOUTS_PER_TASK=8 \
 DIVERSITY_REFILL_BATCH_SIZE=4 \
-GENERATION_MICRO_BATCH_SIZE=4 \
+GENERATION_MICRO_BATCH_SIZE=2 \
 ACTOR_LR=1.0e-5 \
 PATCH_THRESHOLD=3 \
 VLLM_GPU_MEMORY_UTILIZATION=0.60 \
@@ -96,29 +102,30 @@ GPU_MEMORY_MONITOR_INTERVAL_SECONDS=1 \
 VALIDATION_PROGRESS_INTERVAL=25 \
 SAVE_INTERVAL_SECONDS=7200 \
 SAVE_LIMIT=-1 \
-RUN_NAME=ui_s1_qwen25vl_3b_android_control_4gpu_1epoch_v1 \
+RESUME=false \
+RUN_NAME=ui_s1_qwen25vl_3b_android_control_2gpu_1epoch_v1 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-## 5. AMEX 全数据集：1 epoch、4 GPU
+## 5. AMEX 全数据集：1 epoch、2 GPU
 
 ```bash
-docker exec -it -w /data5/zst/biye210/EasyR1 easyr1 bash -lc '
-GPU_IDS=0,1,2,3 \
-MODEL_PATH=/data5/zst/biye210/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-TOKENIZER_PATH=/data5/zst/biye210/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
+GPU_IDS=0,1 \
+MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 DATASET=amex \
-DATA_DIR=/data5/zst/biye210/EasyR1/datasets/amex \
-TRAIN_FILE=/data5/zst/biye210/EasyR1/datasets/amex/amex_train.jsonl \
-VAL_FILE=/data5/zst/biye210/EasyR1/datasets/amex/amex_val.jsonl \
+DATA_DIR=/home/zst/biye215/EasyR1/datasets/amex \
+TRAIN_FILE=/home/zst/biye215/EasyR1/datasets/amex/amex_train.jsonl \
+VAL_FILE=/home/zst/biye215/EasyR1/datasets/amex/amex_val.jsonl \
 EPOCHS=1 \
 ROLLOUT_BATCH_SIZE=4 \
 ACTOR_GLOBAL_BATCH_SIZE=4 \
 ROLLOUT_N=4 \
 MAX_ROLLOUTS_PER_TASK=8 \
 DIVERSITY_REFILL_BATCH_SIZE=4 \
-GENERATION_MICRO_BATCH_SIZE=4 \
+GENERATION_MICRO_BATCH_SIZE=2 \
 ACTOR_LR=1.0e-5 \
 PATCH_THRESHOLD=3 \
 VLLM_GPU_MEMORY_UTILIZATION=0.60 \
@@ -128,17 +135,20 @@ GPU_MEMORY_MONITOR_INTERVAL_SECONDS=1 \
 VALIDATION_PROGRESS_INTERVAL=25 \
 SAVE_INTERVAL_SECONDS=7200 \
 SAVE_LIMIT=-1 \
-RUN_NAME=ui_s1_qwen25vl_3b_amex_4gpu_1epoch_v1 \
+RESUME=false \
+RUN_NAME=ui_s1_qwen25vl_3b_amex_2gpu_1epoch_v1 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
 开始一项新训练时必须使用未存在的 `RUN_NAME`，例如将末尾 `v1` 改为 `v2`；训练脚本会拒绝覆盖已有输出目录。意外中断后，保留原 `RUN_NAME` 并增加 `RESUME=true`，即可从最新 checkpoint 继续。
 
+断点续训必须保持保存时的 GPU 数。本机已有的旧 run 是四卡 FSDP 分片，不能直接用 `GPU_IDS=0,1` 恢复；新的两卡 run 可继续用两卡恢复。脚本会在模型初始化前拒绝不匹配或不完整的 checkpoint。
+
 ## 6. 查看运行状态与结果
 
 ```bash
-RUN_DIR=/data5/zst/biye210/EasyR1/output/<RUN_NAME>
+RUN_DIR=/home/zst/biye215/EasyR1/output/<RUN_NAME>
 
 tail -f "$RUN_DIR/training_progress.log"
 tail -f "$RUN_DIR/semi_online_rollouts.jsonl"

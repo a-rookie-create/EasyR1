@@ -40,6 +40,7 @@ required_runtime_vars=(
     GPU_IDS
     RAY_DASHBOARD_HOST
     VLLM_GPU_MEMORY_UTILIZATION
+    VLLM_ENFORCE_EAGER
     PYTORCH_CUDA_ALLOC_CONF
 )
 for required_var in "${required_runtime_vars[@]}"; do
@@ -64,6 +65,10 @@ case "${RESUME}" in
     true|false) ;;
     *) echo "RESUME must be true or false, got ${RESUME}." >&2; exit 2 ;;
 esac
+case "${VLLM_ENFORCE_EAGER}" in
+    true|false) ;;
+    *) echo "VLLM_ENFORCE_EAGER must be true or false, got ${VLLM_ENFORCE_EAGER}." >&2; exit 2 ;;
+esac
 
 TRAINER_RESUME_ARGS=()
 if [[ -e "${RUN_DIR}" ]]; then
@@ -86,10 +91,42 @@ elif [[ "${RESUME}" == "true" && -z "${RESUME_CHECKPOINT_PATH}" ]]; then
     exit 2
 fi
 
+RESOLVED_RESUME_CHECKPOINT_PATH=
 if [[ "${RESUME}" == "true" ]]; then
+    if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
+        if [[ ! -d "${RESUME_CHECKPOINT_PATH}" ]]; then
+            echo "Cannot resume: checkpoint directory does not exist: ${RESUME_CHECKPOINT_PATH}" >&2
+            exit 2
+        fi
+        RESOLVED_RESUME_CHECKPOINT_PATH=$(cd -- "${RESUME_CHECKPOINT_PATH}" && pwd)
+    else
+        if ! checkpoint_step=$(python3 -c 'import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    step = json.load(stream).get("last_global_step")
+if type(step) is not int or step < 1:
+    raise SystemExit("last_global_step must be a positive integer")
+print(step)' "${RUN_DIR}/checkpoint_tracker.json"); then
+            echo "Cannot resume: invalid checkpoint tracker: ${RUN_DIR}/checkpoint_tracker.json" >&2
+            exit 2
+        fi
+        RESOLVED_RESUME_CHECKPOINT_PATH="${RUN_DIR}/global_step_${checkpoint_step}"
+    fi
+    if [[ ! "$(basename -- "${RESOLVED_RESUME_CHECKPOINT_PATH}")" =~ ^global_step_[1-9][0-9]*$ ]]; then
+        echo "Cannot resume: checkpoint must end with global_step_<positive integer>: ${RESOLVED_RESUME_CHECKPOINT_PATH}" >&2
+        exit 2
+    fi
+    if [[ ! -d "${RESOLVED_RESUME_CHECKPOINT_PATH}/actor" ]]; then
+        echo "Cannot resume: actor checkpoint directory is missing: ${RESOLVED_RESUME_CHECKPOINT_PATH}/actor" >&2
+        exit 2
+    fi
+    if [[ ! -f "${RESOLVED_RESUME_CHECKPOINT_PATH}/dataloader.pt" ]]; then
+        echo "Cannot resume: dataloader state is missing: ${RESOLVED_RESUME_CHECKPOINT_PATH}/dataloader.pt" >&2
+        exit 2
+    fi
+
     TRAINER_RESUME_ARGS=("trainer.find_last_checkpoint=true")
     if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
-        TRAINER_RESUME_ARGS+=("trainer.load_checkpoint_path=${RESUME_CHECKPOINT_PATH}")
+        TRAINER_RESUME_ARGS+=("trainer.load_checkpoint_path=${RESOLVED_RESUME_CHECKPOINT_PATH}")
     fi
 else
     TRAINER_RESUME_ARGS=("trainer.find_last_checkpoint=false")
@@ -116,15 +153,59 @@ is_nonnegative_integer() {
 }
 
 is_nonnegative_number() {
-    [[ "$1" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]]
+    [[ "$1" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]]
+}
+
+is_positive_number() {
+    is_nonnegative_number "$1" && awk -v value="$1" 'BEGIN { exit !((value + 0) > 0) }'
+}
+
+is_unit_interval_number() {
+    is_positive_number "$1" && awk -v value="$1" 'BEGIN { exit !((value + 0) <= 1) }'
+}
+
+is_number_less_than_or_equal() {
+    awk -v left="$1" -v right="$2" 'BEGIN { exit !((left + 0) <= (right + 0)) }'
 }
 
 is_positive_integer "${N_GPUS_PER_NODE}" || {
     echo "N_GPUS_PER_NODE must be a positive integer, got ${N_GPUS_PER_NODE}." >&2
     exit 2
 }
+if (( N_GPUS_PER_NODE != ${#GPU_ID_ARRAY[@]} )); then
+    echo "N_GPUS_PER_NODE (${N_GPUS_PER_NODE}) must match the number of GPU_IDS entries (${#GPU_ID_ARRAY[@]})." >&2
+    exit 2
+fi
+declare -A SEEN_GPU_IDS=()
+for gpu_id in "${GPU_ID_ARRAY[@]}"; do
+    if [[ ! "${gpu_id}" =~ ^[0-9]+$ ]]; then
+        echo "GPU_IDS entries must be non-negative integer device indices, got ${gpu_id@Q}." >&2
+        exit 2
+    fi
+    if [[ -n "${SEEN_GPU_IDS[${gpu_id}]:-}" ]]; then
+        echo "GPU_IDS must not contain duplicate device indices, got ${GPU_IDS}." >&2
+        exit 2
+    fi
+    SEEN_GPU_IDS["${gpu_id}"]=1
+done
+is_positive_integer "${ROLLOUT_BATCH_SIZE}" || {
+    echo "ROLLOUT_BATCH_SIZE must be a positive integer, got ${ROLLOUT_BATCH_SIZE}." >&2
+    exit 2
+}
+is_positive_integer "${ACTOR_GLOBAL_BATCH_SIZE}" || {
+    echo "ACTOR_GLOBAL_BATCH_SIZE must be a positive integer, got ${ACTOR_GLOBAL_BATCH_SIZE}." >&2
+    exit 2
+}
 is_positive_integer "${ROLLOUT_N}" || {
     echo "ROLLOUT_N must be a positive integer, got ${ROLLOUT_N}." >&2
+    exit 2
+}
+if (( ROLLOUT_N < 2 )); then
+    echo "ROLLOUT_N must be at least 2 for GRPO, got ${ROLLOUT_N}." >&2
+    exit 2
+fi
+is_positive_integer "${EXPERIENCE_MICRO_BATCH_SIZE}" || {
+    echo "EXPERIENCE_MICRO_BATCH_SIZE must be a positive integer, got ${EXPERIENCE_MICRO_BATCH_SIZE}." >&2
     exit 2
 }
 is_positive_integer "${MAX_ROLLOUTS_PER_TASK}" || {
@@ -143,13 +224,92 @@ is_nonnegative_number "${SAVE_INTERVAL_SECONDS}" || {
     echo "SAVE_INTERVAL_SECONDS must be a non-negative number, got ${SAVE_INTERVAL_SECONDS}." >&2
     exit 2
 }
+case "${PATCH_IMITATION_ENABLED}" in
+    true|false) ;;
+    *) echo "PATCH_IMITATION_ENABLED must be true or false, got ${PATCH_IMITATION_ENABLED}." >&2; exit 2 ;;
+esac
+is_nonnegative_number "${PATCH_IMITATION_LAMBDA_INITIAL}" || {
+    echo "PATCH_IMITATION_LAMBDA_INITIAL must be a non-negative number, got ${PATCH_IMITATION_LAMBDA_INITIAL}." >&2
+    exit 2
+}
+is_unit_interval_number "${PATCH_IMITATION_LAMBDA_DECAY}" || {
+    echo "PATCH_IMITATION_LAMBDA_DECAY must be in the interval (0, 1], got ${PATCH_IMITATION_LAMBDA_DECAY}." >&2
+    exit 2
+}
+is_nonnegative_number "${PATCH_IMITATION_LAMBDA_MIN}" || {
+    echo "PATCH_IMITATION_LAMBDA_MIN must be a non-negative number, got ${PATCH_IMITATION_LAMBDA_MIN}." >&2
+    exit 2
+}
+is_number_less_than_or_equal "${PATCH_IMITATION_LAMBDA_MIN}" "${PATCH_IMITATION_LAMBDA_INITIAL}" || {
+    echo "PATCH_IMITATION_LAMBDA_MIN (${PATCH_IMITATION_LAMBDA_MIN}) must not exceed PATCH_IMITATION_LAMBDA_INITIAL (${PATCH_IMITATION_LAMBDA_INITIAL})." >&2
+    exit 2
+}
+if [[ "${PATCH_IMITATION_ENABLED}" == "true" ]] && ! is_positive_number "${PATCH_IMITATION_LAMBDA_INITIAL}"; then
+    echo "PATCH_IMITATION_LAMBDA_INITIAL must be positive when PATCH_IMITATION_ENABLED=true." >&2
+    exit 2
+fi
+case "${PATCH_IMITATION_TARGET_MODE}" in
+    action_only) ;;
+    *) echo "PATCH_IMITATION_TARGET_MODE currently supports only action_only, got ${PATCH_IMITATION_TARGET_MODE}." >&2; exit 2 ;;
+esac
+case "${PATCH_HISTORY_MODE}" in
+    keep_model_thinking) ;;
+    *) echo "PATCH_HISTORY_MODE currently supports only keep_model_thinking, got ${PATCH_HISTORY_MODE}." >&2; exit 2 ;;
+esac
 if (( MAX_ROLLOUTS_PER_TASK < ROLLOUT_N )); then
     echo "MAX_ROLLOUTS_PER_TASK (${MAX_ROLLOUTS_PER_TASK}) must be at least ROLLOUT_N (${ROLLOUT_N})." >&2
     exit 2
 fi
+if (( ROLLOUT_BATCH_SIZE % ACTOR_GLOBAL_BATCH_SIZE != 0 )); then
+    echo "ROLLOUT_BATCH_SIZE (${ROLLOUT_BATCH_SIZE}) must be divisible by ACTOR_GLOBAL_BATCH_SIZE (${ACTOR_GLOBAL_BATCH_SIZE})." >&2
+    exit 2
+fi
+ACTOR_EFFECTIVE_GLOBAL_BATCH_SIZE=$((ACTOR_GLOBAL_BATCH_SIZE * ROLLOUT_N))
+if (( ACTOR_EFFECTIVE_GLOBAL_BATCH_SIZE % N_GPUS_PER_NODE != 0 )); then
+    echo "ACTOR_GLOBAL_BATCH_SIZE * ROLLOUT_N (${ACTOR_EFFECTIVE_GLOBAL_BATCH_SIZE}) must be divisible by N_GPUS_PER_NODE (${N_GPUS_PER_NODE})." >&2
+    exit 2
+fi
+if [[ "${RESUME}" == "true" ]]; then
+    checkpoint_model_shards=("${RESOLVED_RESUME_CHECKPOINT_PATH}/actor"/model_world_size_*_rank_*.pt)
+    if (( ${#checkpoint_model_shards[@]} == 0 )); then
+        echo "Cannot resume: actor model shards are missing in ${RESOLVED_RESUME_CHECKPOINT_PATH}/actor." >&2
+        exit 2
+    fi
+    SAVED_ACTOR_WORLD_SIZE=
+    for checkpoint_shard in "${checkpoint_model_shards[@]}"; do
+        checkpoint_shard_name=$(basename -- "${checkpoint_shard}")
+        if [[ ! "${checkpoint_shard_name}" =~ ^model_world_size_([1-9][0-9]*)_rank_[0-9]+[.]pt$ ]]; then
+            continue
+        fi
+        shard_world_size=${BASH_REMATCH[1]}
+        if [[ -z "${SAVED_ACTOR_WORLD_SIZE}" ]]; then
+            SAVED_ACTOR_WORLD_SIZE=${shard_world_size}
+        elif [[ "${SAVED_ACTOR_WORLD_SIZE}" != "${shard_world_size}" ]]; then
+            echo "Cannot resume: checkpoint mixes actor shards from multiple world sizes." >&2
+            exit 2
+        fi
+    done
+    if [[ -z "${SAVED_ACTOR_WORLD_SIZE}" ]]; then
+        echo "Cannot resume: actor shard filenames are invalid in ${RESOLVED_RESUME_CHECKPOINT_PATH}/actor." >&2
+        exit 2
+    fi
+    if (( SAVED_ACTOR_WORLD_SIZE != N_GPUS_PER_NODE )); then
+        echo "Cannot resume ${SAVED_ACTOR_WORLD_SIZE}-GPU FSDP shards with ${N_GPUS_PER_NODE} GPUs; direct cross-world-size resume is unsupported." >&2
+        exit 2
+    fi
+    for ((rank = 0; rank < N_GPUS_PER_NODE; rank++)); do
+        for shard_prefix in model optim extra_state; do
+            expected_shard="${RESOLVED_RESUME_CHECKPOINT_PATH}/actor/${shard_prefix}_world_size_${N_GPUS_PER_NODE}_rank_${rank}.pt"
+            if [[ ! -f "${expected_shard}" ]]; then
+                echo "Cannot resume: checkpoint shard is missing: ${expected_shard}" >&2
+                exit 2
+            fi
+        done
+    done
+fi
 
 # A one-request micro batch causes the semi-online driver to make one vLLM
-# call per trajectory. train.env records the four-GPU default; this fallback
+# call per trajectory. train.env records the two-GPU default; this fallback
 # only applies when a custom TRAIN_ENV leaves the value empty.
 GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE:-${N_GPUS_PER_NODE}}
 is_nonnegative_integer "${GENERATION_MICRO_BATCH_SIZE}" || {
@@ -160,7 +320,7 @@ if (( GENERATION_MICRO_BATCH_SIZE > 0 && GENERATION_MICRO_BATCH_SIZE < N_GPUS_PE
     echo "WARNING: GENERATION_MICRO_BATCH_SIZE=${GENERATION_MICRO_BATCH_SIZE} is below the ${N_GPUS_PER_NODE} visible GPUs; padded duplicate requests cannot increase useful rollout concurrency." >&2
 fi
 
-echo "UI-S1 effective rollout configuration: tasks_per_update=${ROLLOUT_BATCH_SIZE}, selected_rollouts_per_task=${ROLLOUT_N}, max_candidates_per_task=${MAX_ROLLOUTS_PER_TASK}, diversity_refill_batch=${DIVERSITY_REFILL_BATCH_SIZE}, generation_micro_batch=${GENERATION_MICRO_BATCH_SIZE}, visible_gpus=${N_GPUS_PER_NODE}."
+echo "UI-S1 effective rollout configuration: tasks_per_update=${ROLLOUT_BATCH_SIZE}, selected_rollouts_per_task=${ROLLOUT_N}, actor_effective_global_batch=${ACTOR_EFFECTIVE_GLOBAL_BATCH_SIZE}, max_candidates_per_task=${MAX_ROLLOUTS_PER_TASK}, diversity_refill_batch=${DIVERSITY_REFILL_BATCH_SIZE}, generation_micro_batch=${GENERATION_MICRO_BATCH_SIZE}, visible_gpus=${N_GPUS_PER_NODE}."
 
 cd "${EASYR1_ROOT}"
 
@@ -220,6 +380,12 @@ python3 -m verl.trainer.main \
     algorithm.semi_online_generation_micro_batch_size=${GENERATION_MICRO_BATCH_SIZE} \
     algorithm.semi_online_max_rollouts_per_task=${MAX_ROLLOUTS_PER_TASK} \
     algorithm.semi_online_diversity_refill_batch_size=${DIVERSITY_REFILL_BATCH_SIZE} \
+    algorithm.patch_imitation.enabled=${PATCH_IMITATION_ENABLED} \
+    algorithm.patch_imitation.lambda_initial=${PATCH_IMITATION_LAMBDA_INITIAL} \
+    algorithm.patch_imitation.lambda_decay=${PATCH_IMITATION_LAMBDA_DECAY} \
+    algorithm.patch_imitation.lambda_min=${PATCH_IMITATION_LAMBDA_MIN} \
+    algorithm.patch_imitation.target_mode=${PATCH_IMITATION_TARGET_MODE} \
+    algorithm.patch_imitation.history_mode=${PATCH_HISTORY_MODE} \
     algorithm.use_kl_loss=true \
     algorithm.kl_coef=1.0e-4 \
     worker.actor.global_batch_size=${ACTOR_GLOBAL_BATCH_SIZE} \
@@ -241,7 +407,7 @@ python3 -m verl.trainer.main \
     worker.rollout.gpu_memory_utilization=${VLLM_GPU_MEMORY_UTILIZATION} \
     worker.rollout.enable_sleep_mode=${VLLM_ENABLE_SLEEP_MODE} \
     worker.rollout.tensor_parallel_size=1 \
-    worker.rollout.enforce_eager=${VLLM_ENFORCE_EAGER:-false} \
+    worker.rollout.enforce_eager=${VLLM_ENFORCE_EAGER} \
     worker.rollout.max_model_len=${VLLM_MAX_MODEL_LEN} \
     worker.rollout.max_num_batched_tokens=${VLLM_MAX_NUM_BATCHED_TOKENS} \
     worker.reward.reward_function=examples/ui_s1/reward_ui_s1_step.py:compute_score \

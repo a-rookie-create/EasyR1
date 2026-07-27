@@ -4,27 +4,68 @@
 
 ## 当前推荐设置
 
-当前实验使用 Qwen2.5-VL-3B-Instruct、4 张 GPU，并以 LoRA 进行半在线 GRPO 训练。启动脚本是 `examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh`；默认训练参数记录在 `examples/ui_s1/train.env`。AndroidControl 5% 与 AMEX 5% 已分别验证可用 `VLLM_GPU_MEMORY_UTILIZATION=0.60` 运行 1 epoch。
+当前实验使用 Qwen2.5-VL-3B-Instruct、2 张 RTX 3090 24GB，并以 LoRA 进行半在线 GRPO 训练。启动脚本是 `examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh`；默认训练参数记录在 `examples/ui_s1/train.env`。
 
 | 设置 | 当前值 | 含义 |
 | --- | ---: | --- |
-| `GPU_IDS` | `0,1,2,3` | 4 张可见 GPU。 |
+| `GPU_IDS` | `0,1` | 本次训练使用 2 张可见 GPU。 |
 | `EPOCHS` | `1` | 默认训练完整的 1 个 epoch；设置 `MAX_STEPS` 时忽略该值。 |
-| `worker.rollout.tensor_parallel_size` | `1` | 每张 GPU 上各有一个独立的 TP=1 vLLM worker；它们不是一个四卡张量并行 engine。 |
+| `worker.rollout.tensor_parallel_size` | `1` | 每张 GPU 上各有一个独立的 TP=1 vLLM worker；它们不是一个两卡张量并行 engine。 |
 | `ROLLOUT_BATCH_SIZE` | `4` | 每次模型更新采样 4 个**任务**。 |
-| `ACTOR_GLOBAL_BATCH_SIZE` | `4` | actor 更新的全局 batch 大小。 |
+| `ACTOR_GLOBAL_BATCH_SIZE` | `4` | actor 更新的任务级全局 batch 大小；结合 `ROLLOUT_N=4` 后 actor 每个 mini-batch 为 16 个 rollout 样本。 |
 | `ROLLOUT_N` | `4` | 每个任务初始生成并最终希望保留的 rollout 数量。 |
 | `MAX_ROLLOUTS_PER_TASK` | `8` | 某任务未达到 advantage diversity 要求时，候选 rollout 的上限。 |
 | `DIVERSITY_REFILL_BATCH_SIZE` | `4` | 某任务未达 diversity 阈值时一次新增的候选数。默认从 4 条初始候选直接补到 8 条。 |
-| `GENERATION_MICRO_BATCH_SIZE` | `4` | 每个 rollout wave 最多并行调度 4 个不同的活跃轨迹 step；对 4 个 TP=1 worker 是合适的起点。 |
+| `GENERATION_MICRO_BATCH_SIZE` | `2` | 每个 rollout wave 并行调度 2 个不同的活跃轨迹 step，与 2 个 TP=1 worker 对齐。 |
 | `UIS1_ADVANTAGE_STD_THRESHOLD` | `0.3` | 每个任务候选 advantage 的标准差阈值；不足时触发补充 rollout。 |
 | `PATCH_THRESHOLD` | `1` | 一条 UI 轨迹最多允许一次 patch 后继续。 |
-| `VLLM_GPU_MEMORY_UTILIZATION` | `0.60` | 当前 5% 数据集、4 GPU、1 epoch 已验证的 vLLM 显存比例。 |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.60` | 24GB 3090 的保守起点；正式长跑前仍需先做两卡 smoke test。 |
 | `GPU_MEMORY_MONITOR_INTERVAL_SECONDS` | `1` | GPU 显存高水位监控的采样间隔（秒）。 |
 | `VALIDATION_PROGRESS_INTERVAL` | `25` | 每完成 N 个 validation batch 写一条简洁进度记录。 |
 | `VLLM_ENFORCE_EAGER` | `true` | 当前实验使用 eager 模式。 |
 
-`MAX_STEPS` 仅用于 smoke test。每次启动后，应以输出目录的 `experiment_config.json` 中实际写入的 `trainer.max_steps` 为准。例如 `ui_s1_qwen25vl_3b_android_control_rl_4gpu_fast_smoke_v2` 的实际值为 `2`，因此它会执行两个更新 step，而不是一个。
+`MAX_STEPS` 仅用于 smoke test。每次启动后，应以输出目录的 `experiment_config.json` 中实际写入的 `trainer.max_steps` 为准。例如 `ui_s1_qwen25vl_3b_android_control_rl_2gpu_fast_smoke_v1` 的实际值为 `2`，因此它会执行两个更新 step，而不是一个。
+
+## Patch 动作模拟学习
+
+Patch 模拟学习是独立、默认关闭的辅助目标。`PATCH_THRESHOLD` 仍控制 rollout 中最多允许多少次专家动作 patch；`PATCH_IMITATION_ENABLED` 则单独决定这些 patch 是否产生专家动作模拟梯度。因此保持相同的 `PATCH_THRESHOLD` 并切换 `PATCH_IMITATION_ENABLED`，即可进行严格的 GRPO / GRPO+模拟学习消融。
+
+代码支持的主方案直接从原始 `Qwen2.5-VL-3B-Instruct` 开始 RL，不加载动作 SFT checkpoint，也不额外执行预训练 SFT；启用 Patch 模拟学习后，训练前期的专家引导由按需触发的模拟目标提供，后期可通过 lambda 衰减逐步转向 GRPO。仓库默认仍保持关闭，避免在尚未确定实验 lambda 时静默采用任意权重；主实验必须显式设置 `PATCH_IMITATION_ENABLED=true` 和正的 `PATCH_IMITATION_LAMBDA_INITIAL`。
+
+\[
+J_{\text{total}}=J_{\text{GRPO}}+\lambda_{\text{patch}}J_{\text{patch}},
+\qquad
+g_{\text{update}}=g_{\text{GRPO}}+\lambda_{\text{patch}}g_{\text{patch}}
+\]
+
+实现中两项先后反向并累积到同一组 LoRA 参数，在 EasyR1 原有的同一个 Adam 更新边界内统一裁剪和 `optimizer.step()`；没有 patch 时该边界仍是原来的纯 GRPO，功能关闭时不会构造 patch 张量或增加额外前反向。
+
+| 环境变量 | 配置键 | 默认值 | 当前含义 |
+| --- | --- | ---: | --- |
+| `PATCH_IMITATION_ENABLED` | `algorithm.patch_imitation.enabled` | `false` | 是否开启专家动作模拟学习。关闭时不应构造模拟样本或执行额外前反向。 |
+| `PATCH_IMITATION_LAMBDA_INITIAL` | `algorithm.patch_imitation.lambda_initial` | `0.0` | 第一次 trainer update 的模拟目标权重。开启功能时必须显式设为正数。 |
+| `PATCH_IMITATION_LAMBDA_DECAY` | `algorithm.patch_imitation.lambda_decay` | `1.0` | 每完成一次 trainer update 后的乘法衰减，取值范围为 `(0, 1]`。 |
+| `PATCH_IMITATION_LAMBDA_MIN` | `algorithm.patch_imitation.lambda_min` | `0.0` | 模拟目标权重下限，不能超过初始值。 |
+| `PATCH_IMITATION_TARGET_MODE` | `algorithm.patch_imitation.target_mode` | `action_only` | 当前只监督专家 `<tool_call>` 动作 token。 |
+| `PATCH_HISTORY_MODE` | `algorithm.patch_imitation.history_mode` | `keep_model_thinking` | rollout 历史继续保留模型自己的 thinking，不用专家内容替换。 |
+
+第 \(s\) 次 trainer update 使用的权重为：
+
+\[
+\lambda_{\text{patch}}(s)
+=
+\max\left(
+\lambda_{\min},
+\lambda_{\text{initial}}\lambda_{\text{decay}}^{s-1}
+\right),
+\qquad s\ge 1
+\]
+
+这里的 `global_step` 从 1 开始，因此 step 1 恰好使用 `lambda_initial`。衰减单位是完整 trainer update，而不是 patch 样本数；某一步没有可用 patch 时，调度仍由全局 step 唯一确定。
+
+当前模拟样本复用 rollout 当步的提示词与图片，并保留模型生成的 thinking 作为模拟目标权重为零的前缀；只有转换到模型坐标系后的专家动作 token 参与模拟学习。模型 thinking 在原 rollout 中保持不变，也不会被专家 thinking 替换。`thinking_and_action` 与 `replace_with_expert_thinking` 仅是后续扩展方向，目前若传入这些未实现模式，启动脚本和 dataclass 都会立即报错。
+
+Patch 目标只从 diversity 筛选后真正进入 actor 更新的 rollout 构造。同一任务同一步若有 \(M\) 条 rollout 同时发生 patch，每条样本只占该步的 \(1/M\)；再对不同被 patch 的任务-step 等权平均，并在每条样本内部对专家 `<tool_call>` token 求平均。因此“一处 patch”和“同一步重复出现多处相同 patch”的总专家权重一致，actor padding 复制出的行权重固定为零。
 
 ## 定时 checkpoint 与断点续训
 
@@ -37,7 +78,7 @@ checkpoint 是完整训练状态：actor 的 FSDP/LoRA 权重、优化器、学�
 `EPOCHS` / `MAX_STEPS` 要设为希望达到的总更新量，而不是“额外训练量”。例如：
 
 ```bash
-RUN_NAME=ui_s1_qwen25vl_3b_amex_5pct_4gpu_1epoch_v1 \
+RUN_NAME=ui_s1_qwen25vl_3b_amex_5pct_2gpu_1epoch_v1 \
 RESUME=true \
 SAVE_INTERVAL_SECONDS=1800 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
@@ -45,7 +86,11 @@ bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 
 若 checkpoint 不在该 run 目录下，可额外指定 `RESUME_CHECKPOINT_PATH=/absolute/path/to/global_step_N`。恢复时不应使用 `trainer.save_model_only=true`，否则优化器等训练状态不存在；本启动脚本固定使用完整 checkpoint。
 
+FSDP 断点只能用与保存时相同的 GPU 数恢复。当前复制到本机的历史断点是 `world_size=4` 分片，不能直接在本次 `GPU_IDS=0,1` 的两卡训练中续跑；本机新建的两卡 run 可以正常两卡续训。启动脚本会在初始化模型前检查分片数量与完整性，并对四卡断点给出明确错误。若要迁移旧权重，需要先单独合并/重分片并作为新实验启动，这不等同于恢复原优化器和 dataloader 状态。
+
 恢复时 `training_progress.log`、`train.log`、`experiment_log.jsonl` 和 `generations.log` 都会追加写入，不会清空中断前的内容。进度日志会以 `RUN | RESUME` 开始新的一段，并在随后出现 `CHECKPOINT_LOAD | START/END`；其中 `END` 的 step 就是恢复的 checkpoint step，下一次训练更新从该 step 加一开始。
+
+Patch 模拟目标权重没有独立的可变计数器，而是由恢复后的 `global_step` 和上述 lambda 配置直接计算。例如 `global_step_N` 已包含第 N 次 actor 更新，恢复后第一次更新是 N+1，使用的指数为 N。每个 checkpoint 内的 `trainer_state.json` 会记录 step、actor world size、完整 Patch 配置和当步 lambda，并在恢复前执行强一致性校验；显式 checkpoint 路径不存在、tracker 指向的目录缺失、lambda 不一致或训练分片不完整都会直接终止，而不会静默从 step 0 开始。`experiment_config.json` 和新写入的 `experiment_config.resume.json` 仅用于人工查看与审计。
 
 ## 必须区分的三个层级
 
@@ -60,9 +105,9 @@ bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 - **rollout**：同一个任务的一条候选完整轨迹，包含从初始截图到结束的若干动作。
 - **轨迹 step**：一条 rollout 内的一次“当前图像/历史 → 模型生成一个 UI 动作 → 计算该动作奖励”。不同 rollout 的 step 数不同。
 
-因此，`GENERATION_MICRO_BATCH_SIZE=4` 调度的是“当前待生成的轨迹 step”，而不是“一次只生成四条完整 rollout”。同一条 rollout 的 step 0、step 1、step 2 必须顺序生成；不同 rollout 当前所处的 step 可以并行。
+因此，`GENERATION_MICRO_BATCH_SIZE=2` 调度的是“当前待生成的轨迹 step”，而不是“一次生成两条完整 rollout”。同一条 rollout 的 step 0、step 1、step 2 必须顺序生成；不同 rollout 当前所处的 step 可以并行。
 
-当一个 wave 的活跃轨迹少于 4 时，部分 GPU 没有可用的不同请求。例如，已经完成的 rollout 不能再为 GPU 提供工作。这是轨迹长度不同导致的尾部空闲，不表示 micro batch 设置失效。
+当一个 wave 的活跃轨迹少于 2 时，部分 GPU 没有可用的不同请求。例如，已经完成的 rollout 不能再为 GPU 提供工作。这是轨迹长度不同导致的尾部空闲，不表示 micro batch 设置失效。
 
 ## rollout 日志：`semi_online_rollouts.jsonl`
 

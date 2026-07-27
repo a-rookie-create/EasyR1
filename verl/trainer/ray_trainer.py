@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface.
 """
 
 import json
+import math
 import os
 import re
 import time
@@ -41,14 +42,14 @@ from ..single_controller.base import Worker
 from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
-from ..utils.dataset import get_image_size, process_image, qwen_coordinate_transforms
 from ..utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
+from ..utils.dataset import get_image_size, process_image, qwen_coordinate_transforms
 from ..utils.logger import Tracker, TrainingProgressLogger
 from ..utils.py_functional import convert_dict_to_str, timer, unflatten_dict
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import AutoRewardManager
-from .config import PPOConfig
+from .config import PPOConfig, compute_patch_imitation_lambda
 from .core_algos import (
     AdvantageEstimator,
     FixedKLController,
@@ -59,7 +60,6 @@ from .core_algos import (
 )
 from .metrics import (
     compute_data_metrics,
-    compute_length_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     get_length_metric_samples,
@@ -80,6 +80,127 @@ class Role(IntEnum):
     RefPolicy = auto()
     RewardModel = auto()
     ActorRolloutRef = auto()
+
+
+PATCH_IMITATION_TRAINER_STATE = "trainer_state.json"
+PATCH_IMITATION_STATE_VERSION = 1
+PATCH_IMITATION_CONFIG_FIELDS = (
+    "enabled",
+    "lambda_initial",
+    "lambda_decay",
+    "lambda_min",
+    "target_mode",
+    "history_mode",
+)
+
+
+def _patch_imitation_config_dict(config: Any) -> dict[str, Any]:
+    return {field_name: getattr(config, field_name) for field_name in PATCH_IMITATION_CONFIG_FIELDS}
+
+
+def _validate_patch_imitation_resume_state(
+    state: dict[str, Any] | None,
+    current_config: Any,
+    checkpoint_global_step: int,
+) -> None:
+    """Reject resume configurations that would change the auxiliary objective."""
+    current = _patch_imitation_config_dict(current_config)
+    if state is None:
+        if current["enabled"]:
+            raise RuntimeError(
+                "The checkpoint predates patch-imitation state tracking, but patch imitation is enabled. "
+                "Resume with algorithm.patch_imitation.enabled=false or start a new run."
+            )
+        return
+
+    if state.get("version") != PATCH_IMITATION_STATE_VERSION:
+        raise RuntimeError(
+            "Unsupported trainer_state.json version: "
+            f"{state.get('version')!r}; expected {PATCH_IMITATION_STATE_VERSION}."
+        )
+    saved_step = state.get("global_step")
+    if saved_step != checkpoint_global_step:
+        raise RuntimeError(
+            "Checkpoint trainer_state.json global_step does not match its directory: "
+            f"{saved_step!r} != {checkpoint_global_step}."
+        )
+    saved = state.get("patch_imitation")
+    if not isinstance(saved, dict):
+        if current["enabled"]:
+            raise RuntimeError("Checkpoint trainer_state.json has no patch-imitation configuration.")
+        return
+
+    saved_enabled = bool(saved.get("enabled", False))
+    if saved_enabled != current["enabled"]:
+        raise RuntimeError(
+            "Patch imitation cannot be enabled or disabled midway through a resumed run: "
+            f"checkpoint enabled={saved_enabled}, current enabled={current['enabled']}."
+        )
+    if current["enabled"]:
+        mismatches = {
+            key: (saved.get(key), current[key])
+            for key in PATCH_IMITATION_CONFIG_FIELDS
+            if saved.get(key) != current[key]
+        }
+        if mismatches:
+            raise RuntimeError(
+                "Patch-imitation configuration differs from the checkpoint; start a new run for this ablation. "
+                f"Mismatched values: {mismatches}"
+            )
+
+    saved_lambda = state.get("patch_imitation_lambda")
+    expected_lambda = compute_patch_imitation_lambda(current_config, checkpoint_global_step)
+    if (
+        isinstance(saved_lambda, bool)
+        or not isinstance(saved_lambda, (int, float))
+        or not math.isfinite(saved_lambda)
+        or not math.isclose(float(saved_lambda), expected_lambda, rel_tol=1e-12, abs_tol=1e-12)
+    ):
+        raise RuntimeError(
+            "Checkpoint patch_imitation_lambda is missing or inconsistent with its step and configuration: "
+            f"saved={saved_lambda!r}, expected={expected_lambda!r}."
+        )
+
+
+_ACTOR_SHARD_PATTERN = re.compile(r"^model_world_size_(\d+)_rank_(\d+)\.pt$")
+
+
+def _validate_actor_checkpoint_for_resume(checkpoint_path: str, current_world_size: int) -> None:
+    """Fail before worker loading when a full FSDP checkpoint is incompatible."""
+    if not os.path.isdir(checkpoint_path):
+        raise RuntimeError(f"Checkpoint directory does not exist: {checkpoint_path}")
+    if isinstance(current_world_size, bool) or not isinstance(current_world_size, int) or current_world_size < 1:
+        raise ValueError(f"current_world_size must be a positive integer, got {current_world_size!r}.")
+
+    actor_path = os.path.join(checkpoint_path, "actor")
+    if not os.path.isdir(actor_path):
+        raise RuntimeError(f"Checkpoint actor directory is missing: {actor_path}")
+
+    saved_world_sizes = {
+        int(match.group(1))
+        for filename in os.listdir(actor_path)
+        if (match := _ACTOR_SHARD_PATTERN.fullmatch(filename)) is not None
+    }
+    if saved_world_sizes != {current_world_size}:
+        saved_description = sorted(saved_world_sizes) if saved_world_sizes else "no model shards"
+        raise RuntimeError(
+            "FSDP checkpoint world size does not match the current actor world size: "
+            f"checkpoint={saved_description}, current={current_world_size}. "
+            "Direct resume with a different GPU count is unsupported; start a new run or reshard the checkpoint."
+        )
+
+    missing_shards = [
+        os.path.join(actor_path, f"{prefix}_world_size_{current_world_size}_rank_{rank}.pt")
+        for prefix in ("model", "optim", "extra_state")
+        for rank in range(current_world_size)
+        if not os.path.isfile(os.path.join(actor_path, f"{prefix}_world_size_{current_world_size}_rank_{rank}.pt"))
+    ]
+    if missing_shards:
+        raise RuntimeError(f"Checkpoint is incomplete; missing actor shards: {missing_shards}")
+
+    dataloader_path = os.path.join(checkpoint_path, "dataloader.pt")
+    if not os.path.isfile(dataloader_path):
+        raise RuntimeError(f"Checkpoint is incomplete; dataloader state is missing: {dataloader_path}")
 
 
 @dataclass
@@ -584,6 +705,20 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_path)
 
+        patch_imitation_config = _patch_imitation_config_dict(self.config.algorithm.patch_imitation)
+        trainer_state = {
+            "version": PATCH_IMITATION_STATE_VERSION,
+            "global_step": self.global_step,
+            "actor_world_size": self.actor_rollout_ref_wg.world_size,
+            "patch_imitation": patch_imitation_config,
+            "patch_imitation_lambda": compute_patch_imitation_lambda(
+                self.config.algorithm.patch_imitation, self.global_step
+            ),
+        }
+        trainer_state_path = os.path.join(folder_path, PATCH_IMITATION_TRAINER_STATE)
+        with open(trainer_state_path, "w", encoding="utf-8") as f:
+            json.dump(trainer_state, f, ensure_ascii=False, indent=2)
+
         checkpointer_tracker_info = {
             "best_global_step": self.best_global_step,
             "best_val_reward_score": round(self.best_val_reward_score, 4),
@@ -609,13 +744,29 @@ class RayPPOTrainer:
             self._progress("CHECKPOINT_LOAD", "SKIP", reason="no_checkpoint_requested")
             return
 
-        if "global_step_" not in load_checkpoint_path.strip(os.path.sep).split(os.path.sep)[-1]:
-            raise ValueError("`load_checkpoint_path` should end with `global_step_*`.")
+        checkpoint_dir_name = load_checkpoint_path.strip(os.path.sep).split(os.path.sep)[-1]
+        checkpoint_step_match = re.fullmatch(r"global_step_([1-9]\d*)", checkpoint_dir_name)
+        if checkpoint_step_match is None:
+            raise ValueError("`load_checkpoint_path` should end with `global_step_<positive integer>`.")
 
         checkpoint_started = time.perf_counter()
         self._progress("CHECKPOINT_LOAD", "START", path=load_checkpoint_path)
         print(f"Load from checkpoint: {load_checkpoint_path}.")
-        self.global_step = int(load_checkpoint_path.strip(os.path.sep).split("global_step_")[-1])
+        self.global_step = int(checkpoint_step_match.group(1))
+        _validate_actor_checkpoint_for_resume(
+            load_checkpoint_path,
+            current_world_size=self.actor_rollout_ref_wg.world_size,
+        )
+        trainer_state_path = os.path.join(load_checkpoint_path, PATCH_IMITATION_TRAINER_STATE)
+        trainer_state = None
+        if os.path.exists(trainer_state_path):
+            with open(trainer_state_path, encoding="utf-8") as f:
+                trainer_state = json.load(f)
+        _validate_patch_imitation_resume_state(
+            trainer_state,
+            self.config.algorithm.patch_imitation,
+            checkpoint_global_step=self.global_step,
+        )
         actor_path = os.path.join(load_checkpoint_path, "actor")
         self.actor_rollout_ref_wg.load_checkpoint(actor_path)
         if self.use_critic:
@@ -833,6 +984,7 @@ class RayPPOTrainer:
             non_tensors["step_id"].append(example["step_id"])
             non_tensors["task_id"].append(example["task_id"])
             non_tensors["rollout_id"].append(example["rollout_id"])
+            non_tensors["selection_group_key"].append(example["selection_group_key"])
             if (
                 original_sizes
                 and self.processor is not None
@@ -1118,6 +1270,7 @@ class RayPPOTrainer:
                         "step_id": step_id,
                         "task_id": state["task_id"],
                         "rollout_id": state["rollout_id"],
+                        "selection_group_key": state["selection_group_key"],
                         "state_idx": state_idx,
                     }
                 )
@@ -1159,6 +1312,7 @@ class RayPPOTrainer:
                             pass
 
                 extract_match = []
+                patch_applied_flags = []
                 response_lengths = torch.sum(step_batch.batch["response_mask"], dim=-1)
                 for row_idx, example in enumerate(examples):
                     state = states[example["state_idx"]]
@@ -1194,6 +1348,7 @@ class RayPPOTrainer:
                         else:
                             state["finished"] = True
                             termination_reason = "patch_threshold_exhausted"
+                    patch_applied_flags.append(patched)
 
                     state["events"].append(
                         {
@@ -1217,6 +1372,8 @@ class RayPPOTrainer:
                     )
 
                 step_batch.non_tensor_batch["extract_match"] = np.array(extract_match, dtype=object)
+                if self.config.algorithm.patch_imitation.enabled:
+                    step_batch.non_tensor_batch["patch_applied"] = np.array(patch_applied_flags, dtype=object)
                 step_batches.append(step_batch)
 
                 completed_states = []
@@ -1565,6 +1722,21 @@ class RayPPOTrainer:
                 if self.config.trainer.critic_warmup <= self.global_step:
                     self._progress("ACTOR_UPDATE", "START")
                     with timer("update_actor", timing_raw):
+                        if (
+                            self.config.algorithm.semi_online
+                            and self.config.algorithm.patch_imitation.enabled
+                        ):
+                            from examples.ui_s1.patch_imitation import attach_patch_imitation_tensors
+
+                            patch_imitation_lambda = compute_patch_imitation_lambda(
+                                self.config.algorithm.patch_imitation, self.global_step
+                            )
+                            patch_metrics = attach_patch_imitation_tensors(batch, self.tokenizer)
+                            patch_metrics["patch_imitation/lambda"] = patch_imitation_lambda
+                            metrics.update(patch_metrics)
+                            if patch_metrics["patch_imitation/valid_samples"] > 0:
+                                batch.meta_info["patch_imitation_lambda"] = patch_imitation_lambda
+
                         actor_batch = batch
                         if self.config.algorithm.semi_online:
                             # UI-S1's reference trainer pads variable-length
@@ -1577,6 +1749,10 @@ class RayPPOTrainer:
                             actor_batch, actor_padding_size = pad_dataproto_to_divisor(
                                 batch, actor_update_divisor
                             )
+                            if self.config.algorithm.patch_imitation.enabled:
+                                from examples.ui_s1.patch_imitation import zero_patch_imitation_padding
+
+                                zero_patch_imitation_padding(actor_batch, actor_padding_size)
                             metrics["uis1/actor_update_padding"] = float(actor_padding_size)
                         actor_output = self.actor_rollout_ref_wg.update_actor(actor_batch)
 
@@ -1592,6 +1768,9 @@ class RayPPOTrainer:
                         pg_loss=actor_metrics.get("actor/pg_loss"),
                         kl_loss=actor_metrics.get("actor/kl_loss"),
                         grad_norm=actor_metrics.get("actor/grad_norm"),
+                        patch_lambda=metrics.get("patch_imitation/lambda"),
+                        patch_samples=metrics.get("patch_imitation/valid_samples"),
+                        patch_target_tokens=metrics.get("patch_imitation/target_tokens"),
                     )
 
                 # validate

@@ -15,6 +15,7 @@
 PPO config
 """
 
+import math
 import os
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from typing import Optional, Tuple
@@ -60,6 +61,68 @@ class DataConfig:
         self.image_dir = get_abs_path(self.image_dir, prompt="Image directory")
         self.format_prompt = get_abs_path(self.format_prompt, prompt="Format prompt file")
         self.override_chat_template = get_abs_path(self.override_chat_template, prompt="Chat template file")
+
+
+@dataclass
+class PatchImitationConfig:
+    enabled: bool = False
+    """enable the auxiliary expert-action imitation objective"""
+    lambda_initial: float = 0.0
+    """imitation objective weight at the first trainer update; must be positive when enabled"""
+    lambda_decay: float = 1.0
+    """multiplicative decay applied once per completed trainer update"""
+    lambda_min: float = 0.0
+    """lower bound for the imitation objective weight"""
+    target_mode: str = "action_only"
+    """tokens supervised by imitation; currently only `action_only` is implemented"""
+    history_mode: str = "keep_model_thinking"
+    """rollout history policy; currently only `keep_model_thinking` is implemented"""
+
+    def post_init(self):
+        lambda_values = {
+            "lambda_initial": self.lambda_initial,
+            "lambda_decay": self.lambda_decay,
+            "lambda_min": self.lambda_min,
+        }
+        for name, value in lambda_values.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"algorithm.patch_imitation.{name} must be a finite number.")
+
+        if self.lambda_initial < 0:
+            raise ValueError("algorithm.patch_imitation.lambda_initial must be non-negative.")
+        if self.enabled and self.lambda_initial <= 0:
+            raise ValueError(
+                "algorithm.patch_imitation.lambda_initial must be positive when patch imitation is enabled."
+            )
+        if not 0 < self.lambda_decay <= 1:
+            raise ValueError("algorithm.patch_imitation.lambda_decay must be in the interval (0, 1].")
+        if self.lambda_min < 0:
+            raise ValueError("algorithm.patch_imitation.lambda_min must be non-negative.")
+        if self.lambda_min > self.lambda_initial:
+            raise ValueError(
+                "algorithm.patch_imitation.lambda_min must not exceed algorithm.patch_imitation.lambda_initial."
+            )
+        if self.target_mode != "action_only":
+            raise ValueError(
+                "algorithm.patch_imitation.target_mode currently supports only `action_only`; "
+                f"got {self.target_mode!r}."
+            )
+        if self.history_mode != "keep_model_thinking":
+            raise ValueError(
+                "algorithm.patch_imitation.history_mode currently supports only `keep_model_thinking`; "
+                f"got {self.history_mode!r}."
+            )
+
+
+def compute_patch_imitation_lambda(config: PatchImitationConfig, global_step: int) -> float:
+    """Return the effective patch-imitation weight for a one-based trainer update."""
+    if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 1:
+        raise ValueError("global_step must be a positive integer.")
+    if not config.enabled:
+        return 0.0
+
+    completed_updates_before_step = global_step - 1
+    return max(config.lambda_min, config.lambda_initial * config.lambda_decay**completed_updates_before_step)
 
 
 @dataclass
@@ -114,6 +177,12 @@ class AlgorithmConfig:
     """maximum candidates sampled per task before selecting rollout.n trajectories for one UI-S1 update"""
     semi_online_diversity_refill_batch_size: int = 4
     """candidates added at once for each task that fails the UI-S1 diversity threshold"""
+    patch_imitation: PatchImitationConfig = field(default_factory=PatchImitationConfig)
+    """auxiliary expert-action imitation configuration for semi-online patches"""
+
+    def post_init(self):
+        if self.patch_imitation.enabled and not self.semi_online:
+            raise ValueError("algorithm.patch_imitation.enabled=true requires algorithm.semi_online=true.")
 
 
 @dataclass
@@ -182,7 +251,10 @@ class TrainerConfig:
         if self.progress_log_path is None:
             self.progress_log_path = os.path.join(self.save_checkpoint_path, "training_progress.log")
         self.progress_log_path = os.path.abspath(self.progress_log_path)
-        self.load_checkpoint_path = get_abs_path(self.load_checkpoint_path, prompt="Model checkpoint")
+        requested_checkpoint_path = self.load_checkpoint_path
+        self.load_checkpoint_path = get_abs_path(requested_checkpoint_path, prompt="Model checkpoint")
+        if requested_checkpoint_path is not None and self.load_checkpoint_path is None:
+            raise ValueError(f"trainer.load_checkpoint_path does not exist: {requested_checkpoint_path}")
 
 
 @dataclass

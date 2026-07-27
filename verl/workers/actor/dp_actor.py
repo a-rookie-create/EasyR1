@@ -45,6 +45,25 @@ except ImportError:
 __all__ = ["DataParallelPPOActor"]
 
 
+def compute_patch_imitation_objective(log_probs: torch.Tensor, token_weights: torch.Tensor) -> torch.Tensor:
+    """Return the weighted expert-action log-likelihood to maximize.
+
+    ``token_weights`` is constructed by the UI-S1 driver so that thinking and
+    padding tokens have zero weight.  Its non-zero entries average tokens
+    within one expert action, patch samples within one task-step, and finally
+    the distinct patched task-steps in the selected rollout batch.
+    """
+    if log_probs.shape != token_weights.shape:
+        raise ValueError(
+            "Patch log-probabilities and token weights must have the same shape, "
+            f"got {tuple(log_probs.shape)} and {tuple(token_weights.shape)}."
+        )
+    if torch.any(token_weights < 0):
+        raise ValueError("Patch imitation token weights must be non-negative.")
+    supervised_tokens = token_weights > 0
+    return torch.sum(log_probs.masked_select(supervised_tokens) * token_weights.masked_select(supervised_tokens))
+
+
 class DataParallelPPOActor(BasePPOActor):
     def __init__(
         self,
@@ -223,10 +242,32 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
         non_tensor_select_keys = ["multi_modal_inputs"]
+        patch_keys = [
+            "patch_input_ids",
+            "patch_attention_mask",
+            "patch_position_ids",
+            "patch_responses",
+            "patch_token_weights",
+        ]
+        present_patch_keys = [key for key in patch_keys if key in data.batch]
+        if present_patch_keys and len(present_patch_keys) != len(patch_keys):
+            missing_patch_keys = sorted(set(patch_keys) - set(present_patch_keys))
+            raise KeyError(f"Incomplete patch imitation actor batch; missing keys: {missing_patch_keys}")
+        patch_imitation_enabled = len(present_patch_keys) == len(patch_keys)
+        patch_imitation_lambda = float(data.meta_info.get("patch_imitation_lambda", 0.0))
+        if patch_imitation_enabled:
+            if patch_imitation_lambda <= 0.0:
+                raise ValueError("Attached patch imitation data requires a positive patch_imitation_lambda.")
+            select_keys.extend(patch_keys)
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
+        # EasyR1 takes one optimizer step per actor mini-batch.  Patch weights
+        # describe an average over the complete rollout batch, so this factor
+        # keeps its first-order epoch contribution on the same scale as the
+        # sequence of equally sized GRPO mini-batch means.
+        patch_minibatch_scale = len(mini_batches)
 
         metrics = defaultdict(list)
         for _ in range(self.config.ppo_epochs):
@@ -289,6 +330,31 @@ class DataParallelPPOActor(BasePPOActor):
 
                     batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
                     batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
+
+                    if patch_imitation_enabled:
+                        patch_model_inputs = {
+                            "input_ids": model_inputs["patch_input_ids"],
+                            "attention_mask": model_inputs["patch_attention_mask"],
+                            "position_ids": model_inputs["patch_position_ids"],
+                            "responses": model_inputs["patch_responses"],
+                        }
+                        if "multi_modal_inputs" in model_inputs:
+                            patch_model_inputs["multi_modal_inputs"] = model_inputs["multi_modal_inputs"]
+
+                        patch_log_probs = self._forward_micro_batch(patch_model_inputs, temperature=temperature)
+                        patch_objective = compute_patch_imitation_objective(
+                            patch_log_probs, model_inputs["patch_token_weights"]
+                        )
+                        # FSDP averages gradients across data-parallel ranks.
+                        # The driver weights sum to one globally, hence
+                        # world_size restores the intended global objective.
+                        patch_gradient_term = (
+                            patch_imitation_lambda * patch_objective * self.world_size * patch_minibatch_scale
+                        )
+                        (-patch_gradient_term).backward()
+                        batch_metrics["actor/patch_objective"] = patch_objective.detach().item()
+                        batch_metrics["actor/patch_lambda"] = patch_imitation_lambda
+
                     append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()
