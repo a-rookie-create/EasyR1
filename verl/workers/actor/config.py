@@ -43,6 +43,8 @@ class LoraConfig:
 class ModelConfig:
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    lora_adapter_path: Optional[str] = None
+    """Optional PEFT adapter loaded onto ``model_path`` before FSDP initialization."""
     override_config: dict[str, Any] = field(default_factory=dict)
     enable_gradient_checkpointing: bool = True
     trust_remote_code: bool = True
@@ -58,6 +60,11 @@ class ModelConfig:
 
         if self.tokenizer_path is not None and os.path.exists(self.tokenizer_path):
             self.tokenizer_path = os.path.abspath(self.tokenizer_path)
+
+        if self.lora_adapter_path is not None:
+            if not os.path.isdir(self.lora_adapter_path):
+                raise ValueError(f"lora_adapter_path does not exist or is not a directory: {self.lora_adapter_path}")
+            self.lora_adapter_path = os.path.abspath(self.lora_adapter_path)
 
 
 @dataclass

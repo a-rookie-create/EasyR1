@@ -17,10 +17,12 @@ import json
 import os
 import shutil
 import uuid
+from enum import Enum
 
 import pytest
 
 from verl.utils.checkpoint import CHECKPOINT_TRACKER, find_latest_ckpt, remove_obsolete_ckpt
+from verl.utils.checkpoint.fsdp_checkpoint_manager import normalize_peft_config_for_json
 
 
 @pytest.fixture
@@ -48,3 +50,23 @@ def test_remove_obsolete_ckpt(save_checkpoint_path):
     for step in range(5, 30, 5):
         is_exist = step in [10, 25]
         assert os.path.exists(os.path.join(save_checkpoint_path, f"global_step_{step}")) == is_exist
+
+
+class TaskType(Enum):
+    CAUSAL_LM = "CAUSAL_LM"
+
+
+def test_normalize_peft_config_supports_fresh_and_reloaded_adapters():
+    fresh = normalize_peft_config_for_json(
+        {"task_type": TaskType.CAUSAL_LM, "peft_type": TaskType.CAUSAL_LM, "target_modules": {"v_proj", "q_proj"}}
+    )
+    assert fresh == {
+        "task_type": "CAUSAL_LM",
+        "peft_type": "CAUSAL_LM",
+        "target_modules": ["q_proj", "v_proj"],
+    }
+
+    reloaded = normalize_peft_config_for_json(
+        {"task_type": "CAUSAL_LM", "peft_type": TaskType.CAUSAL_LM, "target_modules": {"q_proj"}}
+    )
+    assert reloaded == {"task_type": "CAUSAL_LM", "peft_type": "CAUSAL_LM", "target_modules": ["q_proj"]}

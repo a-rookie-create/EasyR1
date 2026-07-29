@@ -41,6 +41,17 @@ class PatchImitationConfigTest(unittest.TestCase):
         self.assertEqual(patch_config.history_mode, "keep_model_thinking")
         serialized = json.loads(json.dumps(config.to_dict()))
         self.assertFalse(serialized["algorithm"]["patch_imitation"]["enabled"])
+        self.assertTrue(serialized["trainer"]["val_after_train"])
+
+    def test_final_validation_can_be_disabled_independently(self):
+        base = OmegaConf.structured(PPOConfig())
+        cli = OmegaConf.from_dotlist(["trainer.val_after_train=false"])
+
+        config = OmegaConf.to_object(OmegaConf.merge(base, cli))
+        config.deep_post_init()
+
+        self.assertFalse(config.trainer.val_after_train)
+        self.assertFalse(config.trainer.val_only)
 
     def test_structured_cli_override_accepts_scientific_notation(self):
         base = OmegaConf.structured(PPOConfig())

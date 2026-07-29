@@ -105,8 +105,9 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 8
   max_try_make_batch: 20  # -1 means no limit
-  val_freq: 5  # -1 to disable
+  val_freq: 5  # -1 disables periodic validation
   val_before_train: true
+  val_after_train: true
   val_only: false
   val_generations_to_log: 3
   save_freq: 5  # -1 to disable

@@ -55,6 +55,9 @@ RUN_NAME=${RUN_NAME:-ui_s1_qwen25vl_3b_${DATASET_LABEL}_semionline_grpo_lora_$(d
 RUN_DIR=${OUTPUT_ROOT}/${RUN_NAME}
 RESUME=${RESUME:-false}
 RESUME_CHECKPOINT_PATH=${RESUME_CHECKPOINT_PATH:-}
+WARM_START_CHECKPOINT_PATH=${WARM_START_CHECKPOINT_PATH:-}
+WARM_START_DATALOADER=${WARM_START_DATALOADER:-inherit}
+VAL_AFTER_TRAIN=${VAL_AFTER_TRAIN:-true}
 
 TRAINER_MAX_STEPS_ARG=()
 if [[ -n "${MAX_STEPS}" ]]; then
@@ -65,26 +68,106 @@ case "${RESUME}" in
     true|false) ;;
     *) echo "RESUME must be true or false, got ${RESUME}." >&2; exit 2 ;;
 esac
+case "${WARM_START_DATALOADER}" in
+    inherit|reset) ;;
+    *) echo "WARM_START_DATALOADER must be inherit or reset, got ${WARM_START_DATALOADER}." >&2; exit 2 ;;
+esac
+case "${VAL_AFTER_TRAIN}" in
+    true|false) ;;
+    *) echo "VAL_AFTER_TRAIN must be true or false, got ${VAL_AFTER_TRAIN}." >&2; exit 2 ;;
+esac
 case "${VLLM_ENFORCE_EAGER}" in
     true|false) ;;
     *) echo "VLLM_ENFORCE_EAGER must be true or false, got ${VLLM_ENFORCE_EAGER}." >&2; exit 2 ;;
 esac
 
+if [[ -z "${TRAIN_FILE:-}" ]]; then
+    train_candidates=("${DATA_DIR}"/*_train.jsonl)
+    [[ ${#train_candidates[@]} -eq 1 ]] || { echo "Expected one *_train.jsonl in ${DATA_DIR}" >&2; exit 2; }
+    TRAIN_FILE=${train_candidates[0]}
+fi
+if [[ -z "${VAL_FILE:-}" ]]; then
+    val_candidates=("${DATA_DIR}"/*_val.jsonl)
+    [[ ${#val_candidates[@]} -eq 1 ]] || { echo "Expected one *_val.jsonl in ${DATA_DIR}" >&2; exit 2; }
+    VAL_FILE=${val_candidates[0]}
+fi
+
 TRAINER_RESUME_ARGS=()
+TRAINER_WARM_START_ARGS=()
+WARM_START_ADAPTER_PATH=
+WARM_START_STEP=0
+if [[ -n "${WARM_START_CHECKPOINT_PATH}" ]]; then
+    if [[ "${RESUME}" == "true" ]]; then
+        echo "RESUME=true and WARM_START_CHECKPOINT_PATH are mutually exclusive." >&2
+        exit 2
+    fi
+    if [[ -e "${RUN_DIR}" ]]; then
+        echo "Warm start requires a new RUN_NAME; output directory already exists: ${RUN_DIR}" >&2
+        exit 2
+    fi
+    if [[ ! -d "${WARM_START_CHECKPOINT_PATH}" ]]; then
+        echo "Warm-start checkpoint directory does not exist: ${WARM_START_CHECKPOINT_PATH}" >&2
+        exit 2
+    fi
+    RESOLVED_WARM_START_CHECKPOINT_PATH=$(cd -- "${WARM_START_CHECKPOINT_PATH}" && pwd)
+    if [[ "$(basename -- "${RESOLVED_WARM_START_CHECKPOINT_PATH}")" =~ ^global_step_([1-9][0-9]*)$ ]]; then
+        WARM_START_STEP=${BASH_REMATCH[1]}
+    else
+        echo "Warm-start checkpoint must end with global_step_<positive integer>: ${RESOLVED_WARM_START_CHECKPOINT_PATH}" >&2
+        exit 2
+    fi
+    WARM_START_ADAPTER_PATH="${RESOLVED_WARM_START_CHECKPOINT_PATH}/actor/lora_adapter"
+    if ! python3 -c 'import json, sys
+from pathlib import Path
+adapter = Path(sys.argv[1])
+expected_rank, expected_alpha = map(int, sys.argv[2:4])
+expected_modules = {item.strip() for item in sys.argv[4].split(",") if item.strip()}
+config = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+actual_modules = set(config.get("target_modules", []))
+actual_rank = config.get("r")
+actual_alpha = config.get("lora_alpha")
+if actual_rank != expected_rank or actual_alpha != expected_alpha or actual_modules != expected_modules:
+    raise SystemExit("LoRA structure mismatch: adapter rank/alpha/modules=%r/%r/%r, expected=%r/%r/%r" % (actual_rank, actual_alpha, sorted(actual_modules), expected_rank, expected_alpha, sorted(expected_modules)))
+' "${WARM_START_ADAPTER_PATH}" 64 32 "${LORA_TARGET_MODULES}"; then
+        echo "Warm-start LoRA adapter is incompatible with this UI-S1 LoRA layout." >&2
+        exit 2
+    fi
+    EXPECTED_DATA_JSON=$(python3 -c 'import json, sys
+print(json.dumps({"train_files": sys.argv[1], "shuffle": True, "seed": 1, "rollout_batch_size": int(sys.argv[2]), "mini_rollout_batch_size": None}))
+' "${TRAIN_FILE}" "${ROLLOUT_BATCH_SIZE}")
+    python3 -B examples/ui_s1/checkpoint_lineage.py prepare-warm-start \
+        --source-checkpoint "${RESOLVED_WARM_START_CHECKPOINT_PATH}" \
+        --run-dir "${RUN_DIR}" \
+        --dataloader-mode "${WARM_START_DATALOADER}" \
+        --expected-data-json "${EXPECTED_DATA_JSON}"
+    TRAINER_WARM_START_ARGS=(
+        "trainer.warm_start_checkpoint_path=${RESOLVED_WARM_START_CHECKPOINT_PATH}"
+        "trainer.warm_start_dataloader=${WARM_START_DATALOADER}"
+        "trainer.warm_start_global_step=${WARM_START_STEP}"
+        "trainer.append_existing_history=true"
+        "worker.actor.model.lora_adapter_path=${WARM_START_ADAPTER_PATH}"
+    )
+fi
+
 if [[ -e "${RUN_DIR}" ]]; then
-    if [[ "${RESUME}" != "true" ]]; then
-        echo "Refusing to reuse existing run directory: ${RUN_DIR}" >&2
-        echo "Set RESUME=true to restore its latest checkpoint, or set RUN_NAME to a new value." >&2
-        exit 2
-    fi
-    if [[ ! -d "${RUN_DIR}" ]]; then
-        echo "RUN_DIR exists but is not a directory: ${RUN_DIR}" >&2
-        exit 2
-    fi
-    if [[ -z "${RESUME_CHECKPOINT_PATH}" && ! -f "${RUN_DIR}/checkpoint_tracker.json" ]]; then
-        echo "Cannot resume: ${RUN_DIR}/checkpoint_tracker.json is missing." >&2
-        echo "Set RESUME_CHECKPOINT_PATH to a complete global_step_* checkpoint if it lives elsewhere." >&2
-        exit 2
+    if [[ "${RESUME}" == "true" ]]; then
+        if [[ ! -d "${RUN_DIR}" ]]; then
+            echo "RUN_DIR exists but is not a directory: ${RUN_DIR}" >&2
+            exit 2
+        fi
+        if [[ -z "${RESUME_CHECKPOINT_PATH}" && ! -f "${RUN_DIR}/checkpoint_tracker.json" ]]; then
+            echo "Cannot resume: ${RUN_DIR}/checkpoint_tracker.json is missing." >&2
+            echo "Set RESUME_CHECKPOINT_PATH to a complete global_step_* checkpoint if it lives elsewhere." >&2
+            exit 2
+        fi
+    else
+        if [[ -n "${WARM_START_CHECKPOINT_PATH}" ]]; then
+            : # The lineage tool has just created this new warm-start directory.
+        else
+            echo "Refusing to reuse existing run directory: ${RUN_DIR}" >&2
+            echo "Set RESUME=true to restore its latest checkpoint, or set RUN_NAME to a new value." >&2
+            exit 2
+        fi
     fi
 elif [[ "${RESUME}" == "true" && -z "${RESUME_CHECKPOINT_PATH}" ]]; then
     echo "Cannot resume: run directory does not exist: ${RUN_DIR}" >&2
@@ -123,7 +206,10 @@ print(step)' "${RUN_DIR}/checkpoint_tracker.json"); then
         echo "Cannot resume: dataloader state is missing: ${RESOLVED_RESUME_CHECKPOINT_PATH}/dataloader.pt" >&2
         exit 2
     fi
-
+    if [[ "$(dirname -- "${RESOLVED_RESUME_CHECKPOINT_PATH}")" != "$(cd -- "${RUN_DIR}" && pwd)" ]]; then
+        echo "Strict RESUME checkpoint must be inside RUN_DIR; use WARM_START_CHECKPOINT_PATH for a checkpoint from another run." >&2
+        exit 2
+    fi
     TRAINER_RESUME_ARGS=("trainer.find_last_checkpoint=true")
     if [[ -n "${RESUME_CHECKPOINT_PATH}" ]]; then
         TRAINER_RESUME_ARGS+=("trainer.load_checkpoint_path=${RESOLVED_RESUME_CHECKPOINT_PATH}")
@@ -132,9 +218,6 @@ else
     TRAINER_RESUME_ARGS=("trainer.find_last_checkpoint=false")
 fi
 mkdir -p "${RUN_DIR}"
-RUN_LOG=${RUN_LOG:-${RUN_DIR}/train.log}
-exec > >(tee -a "${RUN_LOG}") 2>&1
-set -x
 
 export CUDA_VISIBLE_DEVICES=${GPU_IDS}
 export RAY_DASHBOARD_HOST
@@ -324,6 +407,22 @@ echo "UI-S1 effective rollout configuration: tasks_per_update=${ROLLOUT_BATCH_SI
 
 cd "${EASYR1_ROOT}"
 
+# Roll back the output lineage only after every mode, checkpoint, world-size,
+# and training-parameter check has passed, but before any log writer, monitor,
+# Ray process, or trainer starts.  This makes an explicit older checkpoint a
+# real branch reset: all structured records and checkpoints after that step
+# are removed before new records are appended.
+if [[ "${RESUME}" == "true" ]]; then
+    python3 -B examples/ui_s1/checkpoint_lineage.py prepare-resume-rollback \
+        --run-dir "${RUN_DIR}" --checkpoint "${RESOLVED_RESUME_CHECKPOINT_PATH}"
+fi
+
+# All mode and parameter validation has completed.  Only now begin the raw
+# stdout log, GPU monitor, and Ray training process.
+RUN_LOG=${RUN_LOG:-${RUN_DIR}/train.log}
+exec > >(tee -a "${RUN_LOG}") 2>&1
+set -x
+
 GPU_MEMORY_MONITOR_PATH="${RUN_DIR}/gpu_memory_peak.json"
 python3 -B examples/ui_s1/monitor_gpu_memory.py \
     --gpu-ids "${GPU_IDS}" \
@@ -399,6 +498,7 @@ python3 -m verl.trainer.main \
     worker.actor.model.lora.rank=64 \
     worker.actor.model.lora.alpha=32 \
     worker.actor.model.lora.target_modules=${LORA_TARGET_MODULES} \
+    "${TRAINER_WARM_START_ARGS[@]}" \
     worker.actor.optim.lr=${ACTOR_LR} \
     worker.rollout.n=${ROLLOUT_N} \
     worker.rollout.temperature=0.9 \
@@ -419,6 +519,7 @@ python3 -m verl.trainer.main \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes=1 \
     trainer.val_before_train=false \
+    trainer.val_after_train=${VAL_AFTER_TRAIN} \
     trainer.val_freq=-1 \
     trainer.save_freq=-1 \
     trainer.save_every_n_epochs=${SAVE_EVERY_N_EPOCHS} \

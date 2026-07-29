@@ -15,6 +15,7 @@
 import json
 import os
 from dataclasses import asdict
+from enum import Enum
 from typing import Optional, Union
 
 import torch
@@ -32,6 +33,26 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
 
 from .checkpoint_manager import BaseCheckpointManager
+
+
+def normalize_peft_config_for_json(peft_config: dict) -> dict:
+    """Normalize PEFT dataclass fields across fresh and reloaded adapters.
+
+    PEFT keeps ``task_type`` as an enum for a newly-created adapter, but loads
+    the same JSON value back as a string.  Checkpoint saving must support both
+    forms so a warm-started LoRA can immediately be saved again.
+    """
+    for key in ("task_type", "peft_type"):
+        value = peft_config.get(key)
+        if isinstance(value, Enum):
+            peft_config[key] = value.value
+
+    target_modules = peft_config.get("target_modules")
+    if isinstance(target_modules, set):
+        peft_config["target_modules"] = sorted(target_modules)
+    elif isinstance(target_modules, tuple):
+        peft_config["target_modules"] = list(target_modules)
+    return peft_config
 
 
 class FSDPCheckpointManager(BaseCheckpointManager):
@@ -131,9 +152,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if self.rank == 0:
                 os.makedirs(lora_path, exist_ok=True)
                 peft_config = asdict(self.model._fsdp_wrapped_module.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
+                peft_config = normalize_peft_config_for_json(peft_config)
 
             sharded_lora_weights = get_peft_model_state_dict(
                 self.model._fsdp_wrapped_module, state_dict=model_state_dict

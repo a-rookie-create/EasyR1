@@ -78,6 +78,21 @@ def test_resume_rejects_missing_or_inconsistent_saved_lambda():
     with pytest.raises(RuntimeError, match="missing or inconsistent"):
         _validate_patch_imitation_resume_state(state, config, checkpoint_global_step=4)
 
+
+def test_warm_start_initial_checkpoint_uses_phase_zero_without_lambda():
+    config = _config()
+    state = _state(config, global_step=99)
+    state["phase_step"] = 0
+    state["global_step_offset"] = 99
+    state["patch_imitation_lambda"] = None
+
+    _validate_patch_imitation_resume_state(
+        state,
+        config,
+        checkpoint_global_step=99,
+        checkpoint_phase_step=0,
+    )
+
     state = _state(config)
     state["patch_imitation_lambda"] = 0.123
     with pytest.raises(RuntimeError, match="missing or inconsistent"):

@@ -41,10 +41,11 @@ class Runner:
         is_resuming = config.trainer.load_checkpoint_path is not None or (
             config.trainer.find_last_checkpoint and os.path.isfile(checkpoint_tracker_path)
         )
-        progress_logger = TrainingProgressLogger(config.trainer.progress_log_path, append=is_resuming)
+        has_existing_history = is_resuming or config.trainer.append_existing_history
+        progress_logger = TrainingProgressLogger(config.trainer.progress_log_path, append=has_existing_history)
         progress_logger.log(
             "RUN",
-            "RESUME" if is_resuming else "START",
+            "WARM_START" if config.trainer.warm_start_checkpoint_path is not None else ("RESUME" if is_resuming else "START"),
             experiment=config.trainer.experiment_name,
             gpus_per_node=config.trainer.n_gpus_per_node,
             nodes=config.trainer.nnodes,

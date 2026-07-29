@@ -206,9 +206,11 @@ class TrainerConfig:
     critic_warmup: int = 0
     """critic warmup steps"""
     val_freq: int = -1
-    """validation frequency, -1 means no validation"""
+    """periodic validation frequency, -1 disables periodic validation"""
     val_before_train: bool = True
     """validate before training"""
+    val_after_train: bool = True
+    """validate once after training"""
     val_only: bool = False
     """validate only, skip training"""
     val_generations_to_log: int = 0
@@ -233,6 +235,14 @@ class TrainerConfig:
     """emit one concise validation-progress record after this many validation batches"""
     load_checkpoint_path: Optional[str] = None
     """load checkpoint path"""
+    warm_start_checkpoint_path: Optional[str] = None
+    """Source full checkpoint for LoRA-only warm start; never restores optimizer state."""
+    warm_start_dataloader: str = "inherit"
+    """Whether a warm start restores its source dataloader cursor: ``inherit`` or ``reset``."""
+    warm_start_global_step: int = 0
+    """Source global step used as the visible log/checkpoint offset for a warm start."""
+    append_existing_history: bool = False
+    """Append structured logs prepared before launch instead of truncating them."""
     ray_timeline: Optional[str] = None
     """file to save ray timeline"""
     find_last_checkpoint: bool = True
@@ -255,6 +265,18 @@ class TrainerConfig:
         self.load_checkpoint_path = get_abs_path(requested_checkpoint_path, prompt="Model checkpoint")
         if requested_checkpoint_path is not None and self.load_checkpoint_path is None:
             raise ValueError(f"trainer.load_checkpoint_path does not exist: {requested_checkpoint_path}")
+        requested_warm_start_path = self.warm_start_checkpoint_path
+        self.warm_start_checkpoint_path = get_abs_path(requested_warm_start_path, prompt="Warm-start checkpoint")
+        if requested_warm_start_path is not None and self.warm_start_checkpoint_path is None:
+            raise ValueError(f"trainer.warm_start_checkpoint_path does not exist: {requested_warm_start_path}")
+        if self.load_checkpoint_path is not None and self.warm_start_checkpoint_path is not None:
+            raise ValueError("trainer.load_checkpoint_path and trainer.warm_start_checkpoint_path are mutually exclusive.")
+        if self.warm_start_dataloader not in {"inherit", "reset"}:
+            raise ValueError("trainer.warm_start_dataloader must be 'inherit' or 'reset'.")
+        if isinstance(self.warm_start_global_step, bool) or not isinstance(self.warm_start_global_step, int):
+            raise ValueError("trainer.warm_start_global_step must be an integer.")
+        if self.warm_start_checkpoint_path is None and self.warm_start_global_step != 0:
+            raise ValueError("trainer.warm_start_global_step requires trainer.warm_start_checkpoint_path.")
 
 
 @dataclass

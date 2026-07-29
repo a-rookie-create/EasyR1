@@ -273,19 +273,23 @@ class FSDPWorker(Worker):
         if is_lora_model:
             self.print_rank0("Applying LoRA to actor module")
             model.enable_input_require_grads()
-            if model_config.lora.target_modules == "all-linear":
-                target_modules = model_config.lora.target_modules
+            if model_config.lora_adapter_path is not None:
+                self.print_rank0(f"Loading trainable LoRA adapter from {model_config.lora_adapter_path}")
+                model = peft.PeftModel.from_pretrained(model, model_config.lora_adapter_path, is_trainable=True)
             else:
-                target_modules = [item.strip() for item in model_config.lora.target_modules.split(",") if item.strip()]
+                if model_config.lora.target_modules == "all-linear":
+                    target_modules = model_config.lora.target_modules
+                else:
+                    target_modules = [item.strip() for item in model_config.lora.target_modules.split(",") if item.strip()]
 
-            lora_config = peft.LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=model_config.lora.rank,
-                lora_alpha=model_config.lora.alpha,
-                target_modules=target_modules,
-                exclude_modules=model_config.lora.exclude_modules,
-            )
-            model = get_peft_model(model, lora_config)
+                lora_config = peft.LoraConfig(
+                    task_type=TaskType.CAUSAL_LM,
+                    r=model_config.lora.rank,
+                    lora_alpha=model_config.lora.alpha,
+                    target_modules=target_modules,
+                    exclude_modules=model_config.lora.exclude_modules,
+                )
+                model = get_peft_model(model, lora_config)
             for p in model.parameters():
                 if not p.requires_grad:
                     p.data = p.to(torch.bfloat16)

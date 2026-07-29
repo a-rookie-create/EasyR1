@@ -102,9 +102,12 @@ def _validate_patch_imitation_resume_state(
     state: dict[str, Any] | None,
     current_config: Any,
     checkpoint_global_step: int,
+    checkpoint_phase_step: int | None = None,
 ) -> None:
     """Reject resume configurations that would change the auxiliary objective."""
     current = _patch_imitation_config_dict(current_config)
+    if checkpoint_phase_step is None:
+        checkpoint_phase_step = checkpoint_global_step
     if state is None:
         if current["enabled"]:
             raise RuntimeError(
@@ -149,7 +152,13 @@ def _validate_patch_imitation_resume_state(
             )
 
     saved_lambda = state.get("patch_imitation_lambda")
-    expected_lambda = compute_patch_imitation_lambda(current_config, checkpoint_global_step)
+    # Checkpoints created before warm-start lineage support used global_step as
+    # the optimizer step.  New warm-start checkpoints persist phase_step.
+    if checkpoint_phase_step == 0:
+        if saved_lambda is not None:
+            raise RuntimeError("A phase_step=0 checkpoint must have patch_imitation_lambda=null.")
+        return
+    expected_lambda = compute_patch_imitation_lambda(current_config, checkpoint_phase_step)
     if (
         isinstance(saved_lambda, bool)
         or not isinstance(saved_lambda, (int, float))
@@ -527,18 +536,22 @@ class RayPPOTrainer:
         # contains the most recently updated policy instead of a half-finished
         # optimization step. The interval is measured between completed saves.
         interval_seconds = getattr(self.config.trainer, "save_interval_seconds", 0.0)
+        # Small unit-test fixtures and legacy callers may invoke this helper
+        # before ``fit`` initializes phase_step; in that case the historical
+        # global-step behavior is the compatible fallback.
+        phase_step = getattr(self, "phase_step", self.global_step)
         last_checkpoint_at = getattr(self, "_last_checkpoint_monotonic", None)
         by_time = (
             interval_seconds > 0
             and last_checkpoint_at is not None
             and time.monotonic() - last_checkpoint_at >= interval_seconds
         )
-        by_step = self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0
+        by_step = self.config.trainer.save_freq > 0 and phase_step % self.config.trainer.save_freq == 0
         epoch_interval = self.config.trainer.save_every_n_epochs
         by_epoch = (
             epoch_interval > 0
             and self.steps_per_epoch > 0
-            and self.global_step % (self.steps_per_epoch * epoch_interval) == 0
+            and phase_step % (self.steps_per_epoch * epoch_interval) == 0
         )
         checkpoint_already_saved = getattr(self, "_last_checkpoint_step", None) == self.global_step
         return not checkpoint_already_saved and (by_time or by_step or by_epoch)
@@ -709,10 +722,14 @@ class RayPPOTrainer:
         trainer_state = {
             "version": PATCH_IMITATION_STATE_VERSION,
             "global_step": self.global_step,
+            "phase_step": self.phase_step,
+            "global_step_offset": self.global_step_offset,
             "actor_world_size": self.actor_rollout_ref_wg.world_size,
             "patch_imitation": patch_imitation_config,
-            "patch_imitation_lambda": compute_patch_imitation_lambda(
-                self.config.algorithm.patch_imitation, self.global_step
+            "patch_imitation_lambda": (
+                compute_patch_imitation_lambda(self.config.algorithm.patch_imitation, self.phase_step)
+                if self.phase_step > 0
+                else None
             ),
         }
         trainer_state_path = os.path.join(folder_path, PATCH_IMITATION_TRAINER_STATE)
@@ -762,10 +779,19 @@ class RayPPOTrainer:
         if os.path.exists(trainer_state_path):
             with open(trainer_state_path, encoding="utf-8") as f:
                 trainer_state = json.load(f)
+        self.phase_step = trainer_state.get("phase_step", self.global_step) if trainer_state is not None else self.global_step
+        self.global_step_offset = (
+            trainer_state.get("global_step_offset", 0) if trainer_state is not None else 0
+        )
+        if isinstance(self.phase_step, bool) or not isinstance(self.phase_step, int) or self.phase_step < 0:
+            raise RuntimeError(f"Invalid checkpoint phase_step: {self.phase_step!r}.")
+        if isinstance(self.global_step_offset, bool) or not isinstance(self.global_step_offset, int):
+            raise RuntimeError(f"Invalid checkpoint global_step_offset: {self.global_step_offset!r}.")
         _validate_patch_imitation_resume_state(
             trainer_state,
             self.config.algorithm.patch_imitation,
             checkpoint_global_step=self.global_step,
+            checkpoint_phase_step=self.phase_step,
         )
         actor_path = os.path.join(load_checkpoint_path, "actor")
         self.actor_rollout_ref_wg.load_checkpoint(actor_path)
@@ -780,6 +806,40 @@ class RayPPOTrainer:
         else:
             print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
         self._progress("CHECKPOINT_LOAD", "END", elapsed_s=time.perf_counter() - checkpoint_started)
+
+    def _initialize_warm_start(self) -> None:
+        """Restore only the source dataloader cursor, then checkpoint fresh optimizer state."""
+        source = self.config.trainer.warm_start_checkpoint_path
+        if source is None:
+            return
+        checkpoint_dir_name = source.strip(os.path.sep).split(os.path.sep)[-1]
+        match = re.fullmatch(r"global_step_([1-9]\d*)", checkpoint_dir_name)
+        if match is None:
+            raise ValueError("`warm_start_checkpoint_path` should end with `global_step_<positive integer>`.")
+        source_step = int(match.group(1))
+        if source_step != self.config.trainer.warm_start_global_step:
+            raise RuntimeError(
+                "warm_start_global_step does not match warm_start_checkpoint_path: "
+                f"{self.config.trainer.warm_start_global_step} != {source_step}."
+            )
+        self.global_step_offset = source_step
+        self.global_step = source_step
+        self.phase_step = 0
+        if self.config.trainer.warm_start_dataloader == "inherit":
+            dataloader_path = os.path.join(source, "dataloader.pt")
+            if not os.path.isfile(dataloader_path):
+                raise RuntimeError(f"Warm-start dataloader state is missing: {dataloader_path}")
+            self.train_dataloader.load_state_dict(torch.load(dataloader_path, weights_only=False))
+        self._progress(
+            "WARM_START",
+            "READY",
+            source_checkpoint=source,
+            source_global_step=source_step,
+            dataloader=self.config.trainer.warm_start_dataloader,
+        )
+        # The new run must be independently resumable before its first update.
+        self._save_checkpoint()
+        self._record_checkpoint_saved()
 
     def _maybe_log_val_generations(
         self, inputs: list[str], outputs: list[str], labels: list[str], scores: list[float]
@@ -1585,14 +1645,23 @@ class RayPPOTrainer:
         The light-weight advantage computation is done on the driver process.
         """
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
-        self.global_step = 0
-        self._progress("TRAINING_LOOP", "START", planned_steps=self.training_steps)
+        self.global_step = self.config.trainer.warm_start_global_step
+        self.global_step_offset = self.config.trainer.warm_start_global_step
+        self.phase_step = 0
         main_tqdm = tqdm(range(self.training_steps), desc="Running step", position=0)
         val_metrics: Optional[dict[str, Any]] = None
 
-        # load checkpoint before doing anything
+        # Full resume and LoRA-only warm start are intentionally separate.
         self._load_checkpoint()
-        main_tqdm.update(self.global_step)
+        self._initialize_warm_start()
+        main_tqdm.update(self.phase_step)
+        self._progress(
+            "TRAINING_LOOP",
+            "START",
+            planned_steps=self.training_steps,
+            phase_step=self.phase_step,
+            global_step_offset=self.global_step_offset,
+        )
         # Resuming begins a fresh wall-clock interval. Checkpoint I/O and model
         # restoration should not make the first resumed update save immediately.
         self._last_checkpoint_step = -1
@@ -1609,8 +1678,9 @@ class RayPPOTrainer:
         self.data_iterator = iter(self.train_dataloader)
         if self.config.algorithm.semi_online and not self.config.algorithm.use_kl_loss:
             raise ValueError("UI-S1 semi-online RL requires algorithm.use_kl_loss=true so KL remains separate from returns.")
-        while self.global_step < self.training_steps:
-            self.global_step += 1
+        while self.phase_step < self.training_steps:
+            self.phase_step += 1
+            self.global_step = self.global_step_offset + self.phase_step
             self._progress(
                 "STEP",
                 "START",
@@ -1719,7 +1789,7 @@ class RayPPOTrainer:
                     metrics.update(critic_metrics)
 
                 # update actor
-                if self.config.trainer.critic_warmup <= self.global_step:
+                if self.config.trainer.critic_warmup <= self.phase_step:
                     self._progress("ACTOR_UPDATE", "START")
                     with timer("update_actor", timing_raw):
                         if (
@@ -1729,7 +1799,7 @@ class RayPPOTrainer:
                             from examples.ui_s1.patch_imitation import attach_patch_imitation_tensors
 
                             patch_imitation_lambda = compute_patch_imitation_lambda(
-                                self.config.algorithm.patch_imitation, self.global_step
+                                self.config.algorithm.patch_imitation, self.phase_step
                             )
                             patch_metrics = attach_patch_imitation_tensors(batch, self.tokenizer)
                             patch_metrics["patch_imitation/lambda"] = patch_imitation_lambda
@@ -1777,7 +1847,7 @@ class RayPPOTrainer:
                 if (
                     self.val_reward_fn is not None
                     and self.config.trainer.val_freq > 0
-                    and self.global_step % self.config.trainer.val_freq == 0
+                    and self.phase_step % self.config.trainer.val_freq == 0
                 ):
                     with timer("validation", timing_raw):
                         val_metrics = self._validate()
@@ -1810,12 +1880,12 @@ class RayPPOTrainer:
             )
             main_tqdm.update()
 
-        # perform validation after training
-        if self.val_reward_fn is not None:
+        # perform validation after training when explicitly enabled
+        if self.val_reward_fn is not None and self.config.trainer.val_after_train:
             if (
                 val_metrics is None
                 or self.config.trainer.val_freq <= 0
-                or self.global_step % self.config.trainer.val_freq != 0
+                or self.phase_step % self.config.trainer.val_freq != 0
             ):
                 val_metrics = self._validate()
                 self.logger.log(data=val_metrics, step=self.global_step)
@@ -1828,4 +1898,4 @@ class RayPPOTrainer:
             self._save_checkpoint()
             self._record_checkpoint_saved()
             self._progress("CHECKPOINT_SAVE", "END", final=True, elapsed_s=time.perf_counter() - final_checkpoint_started)
-        self._progress("TRAINING_LOOP", "END", completed_steps=self.global_step)
+        self._progress("TRAINING_LOOP", "END", completed_steps=self.global_step, completed_phase_steps=self.phase_step)

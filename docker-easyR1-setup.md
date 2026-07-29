@@ -1,8 +1,8 @@
 # EasyR1 UI-S1 操作命令
 
-本页只保留日常操作所需命令。训练逻辑、参数说明、日志字段和显存含义见 [EasyR1/docs/ui_s1_training.md](EasyR1/docs/ui_s1_training.md)。
+本页只保留日常操作所需命令。训练逻辑、参数说明、日志字段和显存含义见 [docs/ui_s1_training.md](docs/ui_s1_training.md)。
 
-## 1. 一次性环境准备
+## 1. 环境准备
 
 宿主机确认 GPU：
 
@@ -57,125 +57,226 @@ python3 -B examples/ui_s1/prepare_ui_s1_amex_rl_data.py \
 
 需要重新生成已有数据时，在对应命令末尾加 `--overwrite`。
 
-## 3. 训练前检查
+## 3. AMEX 训练模式验证命令
 
-```bash
-docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
-python3 -m pytest -q \
-  tests/test_patch_imitation_config.py \
-  tests/test_patch_imitation_actor.py \
-  tests/test_patch_imitation_resume.py \
-  tests/test_ui_s1_patch_imitation.py \
-  tests/test_ui_s1_reward.py \
-  tests/test_ui_s1_advantage.py \
-  tests/test_ui_s1_rollout_support.py \
-  tests/test_ui_s1_gpu_monitor.py
-'
+以下六组命令已经完成实际验证，覆盖普通训练、严格续训、LoRA 热启动以及 Patch 模仿学习开关的有效组合。
+
+| 训练入口 | 模拟学习关闭 | 模拟学习开启 |
+|---|---:|---:|
+| 普通新训练 | 试验 1 | 试验 3 |
+| 严格继续训练 | 试验 2 | 试验 5 |
+| LoRA 热启动 | 试验 6 | 试验 4 |
+
+两条依赖链的执行顺序为：
+
+```text
+试验 1 → 试验 2 → 试验 4
+试验 3 → 试验 5 → 试验 6
 ```
 
-## 4. AndroidControl 全数据集：1 epoch、2 GPU
+公共约定：
 
-下面命令默认是 `PATCH_IMITATION_ENABLED=false` 的纯 GRPO 基线。运行 GRPO+Patch 主实验时，还需显式加入 `PATCH_IMITATION_ENABLED=true`、正的 `PATCH_IMITATION_LAMBDA_INITIAL`，以及选定的 decay/min；这里不替你虚构尚未确认的 lambda 数值。
+- 基础模型为 `/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct`。
+- `DATASET=amex` 自动使用 `/home/zst/biye215/EasyR1/datasets/amex` 中的训练集和验证集。
+- 每条命令新增 2 个 actor update，每步处理 4 条指令。
+- `VAL_AFTER_TRAIN=false` 关闭训练结束后的验证集推理，不影响训练和 checkpoint 保存。
+- 新训练和热启动必须使用尚不存在的 `RUN_NAME`。
+
+### 试验 1：普通新训练，关闭模拟学习
 
 ```bash
 docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
-GPU_IDS=0,1 \
+DATASET=amex \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-DATASET=android_control \
-DATA_DIR=/home/zst/biye215/EasyR1/datasets/android_control \
-TRAIN_FILE=/home/zst/biye215/EasyR1/datasets/android_control/android_control_train.jsonl \
-VAL_FILE=/home/zst/biye215/EasyR1/datasets/android_control/android_control_val.jsonl \
+RUN_NAME=verify_matrix_nopatch_v2 \
+RESUME=false \
+MAX_STEPS=2 \
+GPU_IDS=0,1 \
 EPOCHS=1 \
 ROLLOUT_BATCH_SIZE=4 \
 ACTOR_GLOBAL_BATCH_SIZE=4 \
 ROLLOUT_N=4 \
-MAX_ROLLOUTS_PER_TASK=8 \
-DIVERSITY_REFILL_BATCH_SIZE=4 \
-GENERATION_MICRO_BATCH_SIZE=2 \
 ACTOR_LR=1.0e-5 \
-PATCH_THRESHOLD=3 \
-VLLM_GPU_MEMORY_UTILIZATION=0.60 \
-VLLM_ENFORCE_EAGER=true \
-VLLM_ENABLE_SLEEP_MODE=true \
-GPU_MEMORY_MONITOR_INTERVAL_SECONDS=1 \
-VALIDATION_PROGRESS_INTERVAL=25 \
-SAVE_INTERVAL_SECONDS=7200 \
-SAVE_LIMIT=-1 \
-RESUME=false \
-RUN_NAME=ui_s1_qwen25vl_3b_android_control_2gpu_1epoch_v1 \
+VAL_AFTER_TRAIN=false \
+SAVE_INTERVAL_SECONDS=18000 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-## 5. AMEX 全数据集：Patch 模仿学习、1 epoch、2 GPU
+预期生成 step 1–2，创建全新的 LoRA、optimizer 和 scheduler，并保存 `global_step_2`。
+
+### 试验 2：严格继续训练，关闭模拟学习
 
 ```bash
 docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
-# 当前 v3 的实际续训命令。仅在该 run 已停止时执行；运行中不要重复执行。
-GPU_IDS=0,2 \
+DATASET=amex \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-DATASET=amex \
-DATA_DIR=/home/zst/biye215/EasyR1/datasets/amex \
-TRAIN_FILE=/home/zst/biye215/EasyR1/datasets/amex/amex_train.jsonl \
-VAL_FILE=/home/zst/biye215/EasyR1/datasets/amex/amex_val.jsonl \
+RUN_NAME=verify_matrix_nopatch_v2 \
+RESUME=true \
+MAX_STEPS=4 \
+GPU_IDS=0,1 \
 EPOCHS=1 \
 ROLLOUT_BATCH_SIZE=4 \
 ACTOR_GLOBAL_BATCH_SIZE=4 \
 ROLLOUT_N=4 \
-MAX_ROLLOUTS_PER_TASK=8 \
-DIVERSITY_REFILL_BATCH_SIZE=4 \
-GENERATION_MICRO_BATCH_SIZE=2 \
+ACTOR_LR=1.0e-5 \
+VAL_AFTER_TRAIN=false \
+SAVE_INTERVAL_SECONDS=18000 \
+bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
+'
+```
+
+预期从 tracker 指向的 `global_step_2` 恢复完整训练状态，新增 step 3–4，并保存 `global_step_4`。
+
+### 试验 3：普通新训练，开启模拟学习
+
+```bash
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
+DATASET=amex \
+MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+RUN_NAME=verify_matrix_patch_v2 \
+RESUME=false \
+MAX_STEPS=2 \
+GPU_IDS=0,1 \
+EPOCHS=1 \
+ROLLOUT_BATCH_SIZE=4 \
+ACTOR_GLOBAL_BATCH_SIZE=4 \
+ROLLOUT_N=4 \
 ACTOR_LR=1.0e-5 \
 PATCH_THRESHOLD=3 \
-VLLM_GPU_MEMORY_UTILIZATION=0.60 \
-VLLM_ENFORCE_EAGER=true \
-VLLM_ENABLE_SLEEP_MODE=true \
-GPU_MEMORY_MONITOR_INTERVAL_SECONDS=1 \
-VALIDATION_PROGRESS_INTERVAL=25 \
 PATCH_IMITATION_ENABLED=true \
 PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
 PATCH_IMITATION_LAMBDA_DECAY=0.994 \
 PATCH_IMITATION_LAMBDA_MIN=0.0 \
 PATCH_IMITATION_TARGET_MODE=action_only \
 PATCH_HISTORY_MODE=keep_model_thinking \
-SAVE_EVERY_N_EPOCHS=1 \
+VAL_AFTER_TRAIN=false \
 SAVE_INTERVAL_SECONDS=18000 \
-SAVE_LIMIT=-1 \
-RESUME=true \
-RUN_NAME=ui_s1_qwen25vl_3b_amex_2gpu_patch_1epoch_v3 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-该命令从 `checkpoint_tracker.json` 所指向的最新完整 checkpoint 恢复；当前设置将时间保存间隔从 2 小时改为 5 小时。停机等待时间不计入保存间隔，恢复完成后重新计时。开始一项新训练时必须使用未存在的 `RUN_NAME`、设置 `RESUME=false`，并保留同样的 Patch 模仿参数。
+预期生成 step 1–2；对应的 imitation lambda 依次为 `1.0`、`0.994`，并保存 `global_step_2`。
 
-### 断点续训：参数变更边界
+### 试验 4：从无模拟学习 checkpoint 热启动，并开启模拟学习
 
-下表中的“可修改”指在不改变已保存模型/优化器状态的前提下可以修改；“不可修改”是代码会明确拒绝，或会使续训不再是同一训练实验。
+```bash
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
+DATASET=amex \
+MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+RUN_NAME=verify_matrix_warm_patch_from_nopatch_v2 \
+RESUME=false \
+WARM_START_CHECKPOINT_PATH=/home/zst/biye215/EasyR1/output/verify_matrix_nopatch_v2/global_step_4 \
+WARM_START_DATALOADER=inherit \
+MAX_STEPS=2 \
+GPU_IDS=0,1 \
+EPOCHS=1 \
+ROLLOUT_BATCH_SIZE=4 \
+ACTOR_GLOBAL_BATCH_SIZE=4 \
+ROLLOUT_N=4 \
+ACTOR_LR=1.0e-5 \
+PATCH_THRESHOLD=3 \
+PATCH_IMITATION_ENABLED=true \
+PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
+PATCH_IMITATION_LAMBDA_DECAY=0.994 \
+PATCH_IMITATION_LAMBDA_MIN=0.0 \
+PATCH_IMITATION_TARGET_MODE=action_only \
+PATCH_HISTORY_MODE=keep_model_thinking \
+VAL_AFTER_TRAIN=false \
+SAVE_INTERVAL_SECONDS=18000 \
+bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
+'
+```
 
-| 分类 | 参数 | 续训时是否可修改 | 依据与限制 |
-|---|---|---|---|
-| 原地续训时保持 | `RUN_NAME`、`OUTPUT_ROOT` | 否 | 要续写原 run 的日志与 checkpoint，必须定位到原 run 目录及其 `checkpoint_tracker.json`；改路径并显式给出 `RESUME_CHECKPOINT_PATH` 属于从该 checkpoint 派生新 run。 |
-| 必须保持 | `RESUME` | 必须为 `true` | 现有输出目录配合 `RESUME=false` 会被启动脚本拒绝。 |
-| 代码明确校验 | GPU 数量 / FSDP world size | 否 | 必须与 checkpoint 的 actor 分片 world size 相同；当前为 2。缺少 `model`、`optim`、`extra_state` 分片或 `dataloader.pt` 也会拒绝恢复。 |
-| 可修改 | `GPU_IDS` 的具体编号 | 是 | 可由 `0,1` 改为当前的 `0,2`；前提是设备数量仍为 2、CUDA 环境兼容且显存足够。 |
-| 代码明确校验 | `PATCH_IMITATION_ENABLED` | 否 | 必须与 checkpoint 保存的开关一致。 |
-| 代码明确校验 | `PATCH_IMITATION_LAMBDA_INITIAL`、`LAMBDA_DECAY`、`LAMBDA_MIN` | 否 | 必须与 checkpoint 一致，保证后续 \(\lambda_t\) 连续。 |
-| 代码明确校验 | `PATCH_IMITATION_TARGET_MODE`、`PATCH_HISTORY_MODE` | 否 | 必须与 checkpoint 一致。 |
-| 应保持不变 | 模型/Tokenizer 路径、LoRA rank/alpha/target modules、FSDP 结构 | 否 | 虽非每项都单独比较，但 checkpoint 的模型与优化器状态依赖相同参数拓扑；改动可能加载失败或破坏实验连续性。 |
-| 应保持不变 | 数据集文件、shuffle/seed、batch size、`ROLLOUT_N`、数据长度 | 否 | checkpoint 保存并恢复 dataloader cursor；改动数据或批处理结构会使后续样本序列和训练语义不连续。 |
-| 应保持不变 | reward、GRPO/UI-S1 参数、KL、actor LR、rollout 温度/采样参数、`PATCH_THRESHOLD` | 否 | 代码不会逐项阻止，但它们会改变后续优化目标、奖励、轨迹分布或更新尺度；应新建 run 做消融。 |
-| 可修改 | `SAVE_INTERVAL_SECONDS` | 是 | 只控制恢复后下一次时间保存；当前从 `7200` 改为 `18000` 秒。 |
-| 可修改 | `SAVE_LIMIT`、`SAVE_EVERY_N_EPOCHS` | 是 | 只影响后续 checkpoint 保留与保存频率。 |
-| 可修改 | `GPU_MEMORY_MONITOR_INTERVAL_SECONDS`、`VALIDATION_PROGRESS_INTERVAL`、logger、Ray dashboard | 是 | 只影响监控或日志。 |
-| 条件可修改 | `EPOCHS` / `MAX_STEPS` | 可以延长，不应缩短到当前 step 以下 | 用于明确延长训练总步数；会形成新的训练阶段，应在实验记录中注明。 |
-| 条件可修改 | `RESUME_CHECKPOINT_PATH` | 是 | 可指定同一兼容 run 的较早完整 `global_step_<n>` checkpoint，用于回退；仍受 world size、Patch 配置和完整性校验。 |
+预期复制源 run 的 step 1–4 历史，只继承 `global_step_4` 的 LoRA，并用新的 optimizer 和 scheduler 生成 step 5–6。新阶段的 imitation lambda 从 `1.0`、`0.994` 重新计数。
 
-时间 checkpoint 只会在一个完整 actor update 后检查。当前 `save_freq=-1`，因此没有“每 N step 保存”；另有 `SAVE_EVERY_N_EPOCHS=1` 的 epoch 末保存和训练正常结束时的兜底保存。
+### 试验 5：严格继续训练，开启模拟学习
 
-## 6. 查看运行状态与结果
+```bash
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
+DATASET=amex \
+MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+RUN_NAME=verify_matrix_patch_v2 \
+RESUME=true \
+MAX_STEPS=4 \
+GPU_IDS=0,1 \
+EPOCHS=1 \
+ROLLOUT_BATCH_SIZE=4 \
+ACTOR_GLOBAL_BATCH_SIZE=4 \
+ROLLOUT_N=4 \
+ACTOR_LR=1.0e-5 \
+PATCH_THRESHOLD=3 \
+PATCH_IMITATION_ENABLED=true \
+PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
+PATCH_IMITATION_LAMBDA_DECAY=0.994 \
+PATCH_IMITATION_LAMBDA_MIN=0.0 \
+PATCH_IMITATION_TARGET_MODE=action_only \
+PATCH_HISTORY_MODE=keep_model_thinking \
+VAL_AFTER_TRAIN=false \
+SAVE_INTERVAL_SECONDS=18000 \
+bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
+'
+```
+
+预期从 `global_step_2` 恢复完整状态并新增 step 3–4；imitation lambda 连续衰减为约 `0.988036`、`0.982107784`。
+
+### 试验 6：从模拟学习 checkpoint 热启动，并关闭模拟学习
+
+```bash
+docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
+DATASET=amex \
+MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
+RUN_NAME=verify_matrix_warm_nopatch_from_patch_v2 \
+RESUME=false \
+WARM_START_CHECKPOINT_PATH=/home/zst/biye215/EasyR1/output/verify_matrix_patch_v2/global_step_4 \
+WARM_START_DATALOADER=inherit \
+MAX_STEPS=2 \
+GPU_IDS=0,1 \
+EPOCHS=1 \
+ROLLOUT_BATCH_SIZE=4 \
+ACTOR_GLOBAL_BATCH_SIZE=4 \
+ROLLOUT_N=4 \
+ACTOR_LR=1.0e-5 \
+VAL_AFTER_TRAIN=false \
+SAVE_INTERVAL_SECONDS=18000 \
+bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
+'
+```
+
+预期复制源 run 的 step 1–4 历史，只继承 `global_step_4` 的 LoRA，并用新的 optimizer 和 scheduler 生成 step 5–6；源历史中的 imitation 指标保留，新步骤不再产生 imitation loss。
+
+## 4. 训练模式边界
+
+| 模式 | 入口参数 | 输出目录 | 加载状态 | 数据位置 | 训练配置 |
+|---|---|---|---|---|---|
+| 普通新训练 | `RESUME=false`，不设置热启动路径 | 必须是新目录 | 基座模型 + 新 LoRA、新 optimizer、新 scheduler | 从头开始 | 可自由设置 |
+| 严格续训 | `RESUME=true` | 使用原 `RUN_NAME` | 模型、optimizer、scheduler、RNG、dataloader | 从 checkpoint 继续 | Patch 配置和训练拓扑必须兼容 |
+| LoRA 热启动 | `RESUME=false` + `WARM_START_CHECKPOINT_PATH` | 必须是新目录 | 只继承 LoRA，其余状态重新创建 | 由 `WARM_START_DATALOADER` 决定 | 可自由修改，包括启停模拟学习 |
+
+严格续训没有设置 `RESUME_CHECKPOINT_PATH` 时，从 `checkpoint_tracker.json` 的 `last_global_step` 指向的最新完整 checkpoint 恢复。`MAX_STEPS` 是当前训练阶段的累计目标步数：从 phase step 2 再训练两步时，应设置为 4。
+
+热启动的 `WARM_START_DATALOADER=inherit` 会从源 checkpoint 后的下一个 batch 继续，要求训练文件、shuffle seed 和 rollout batch size 兼容；使用 `reset` 则保留 LoRA，但从新数据顺序开头开始。新目录会复制截至源 step 的结构化历史，并建立同编号的初始 checkpoint，使可视化曲线保持连续。
+
+不要同时设置 `RESUME=true` 和 `WARM_START_CHECKPOINT_PATH`。
+
+### 严格续训的日志回退
+
+显式从同一 run 的较早 `RESUME_CHECKPOINT_PATH` 恢复时，启动脚本会在训练前：
+
+- 将 `training_progress.log`、`experiment_log.jsonl` 和 `semi_online_rollouts.jsonl` 截断到恢复 step。
+- 删除恢复 step 之后的 checkpoint 目录。
+- 将不能安全逐行截断的原始日志移入 `rollback_archive/before_global_step_<N>/`。
+- 将回滚详情写入 `rollback_archive/before_global_step_<N>/rollback.json`。
+
+因此，从 step 99 恢复一个已有 step 104 日志的 run 时，旧 step 100–104 会先被移除，重新训练后不会出现重复 step。所有 checkpoint 完整性、GPU world size 和训练参数检查通过后才执行回滚。
+
+## 5. 查看运行状态与结果
 
 ```bash
 RUN_DIR=/home/zst/biye215/EasyR1/output/<RUN_NAME>
@@ -186,4 +287,6 @@ cat "$RUN_DIR/gpu_memory_peak.json"
 cat "$RUN_DIR/experiment_log.jsonl"
 ```
 
-训练完成后，`global_step_<n>/` 为 checkpoint；`training_progress.log` 用于查看阶段和耗时，`gpu_memory_peak.json` 用于查看 GPU 显存峰值。验证使用 `*_val.jsonl`；`*_test.jsonl` 不参与训练。
+训练完成后，`global_step_<n>/` 为完整 checkpoint；其中 `actor/lora_adapter/` 可用于 vLLM 部署。`training_progress.log` 用于查看阶段和耗时，`experiment_log.jsonl` 用于可视化训练指标，`gpu_memory_peak.json` 用于查看 GPU 显存峰值。
+
+设置 `VAL_AFTER_TRAIN=false` 时不会执行训练结束后的验证集推理；设为 `true` 或不填写时使用 `*_val.jsonl` 验证。`*_test.jsonl` 不参与训练。

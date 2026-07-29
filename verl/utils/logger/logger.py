@@ -71,15 +71,19 @@ class FileLogger(Logger):
         self.is_resuming = trainer_config.get("load_checkpoint_path") is not None or (
             trainer_config.get("find_last_checkpoint", False) and os.path.isfile(checkpoint_tracker_path)
         )
+        self.append_existing_history = self.is_resuming or bool(trainer_config.get("append_existing_history", False))
         config_filename = "experiment_config.resume.json" if self.is_resuming else "experiment_config.json"
         with open(os.path.join(trainer_config["save_checkpoint_path"], config_filename), "w") as f:
             json.dump(config, f, indent=2)
 
-        log_mode = "a" if self.is_resuming else "w"
+        log_mode = "a" if self.append_existing_history else "w"
         with open(os.path.join(trainer_config["save_checkpoint_path"], "experiment_log.jsonl"), log_mode) as f:
             pass
 
-        with open(os.path.join(trainer_config["save_checkpoint_path"], "generations.log"), log_mode) as f:
+        # Generation logs have no stable trainer-step field, so a warm-start
+        # run deliberately starts a fresh file instead of mixing lineages.
+        generation_log_mode = "a" if self.is_resuming else "w"
+        with open(os.path.join(trainer_config["save_checkpoint_path"], "generations.log"), generation_log_mode) as f:
             pass
 
     def log(self, data: dict[str, Any], step: int) -> None:

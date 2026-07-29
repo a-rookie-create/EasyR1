@@ -2,6 +2,14 @@
 
 本文记录当前 EasyR1 中 UI-S1 AndroidControl / AMEX 的训练设置、rollout 调度单位，以及 `training_progress.log` 的阅读方法。面向人工操作的简洁命令见仓库外层的 `docker-easyR1-setup.md`。
 
+## Checkpoint 谱系：严格续训与 LoRA 热启动
+
+严格续训使用 `RESUME=true`，恢复完整 FSDP 模型、optimizer、scheduler、RNG 和 dataloader 状态；它仍是同一实验，因此 Patch imitation 配置必须一致。启动前会将结构化日志和 checkpoint 回退到实际恢复点，避免旧分支混入后续可视化。
+
+LoRA 热启动使用新的 `RUN_NAME`、`RESUME=false` 和 `WARM_START_CHECKPOINT_PATH=.../global_step_<N>`。它只加载该 checkpoint 的 `actor/lora_adapter`，创建新的 optimizer/scheduler，且可自由修改 RL 与 Patch 配置。`WARM_START_DATALOADER=inherit` 恢复数据游标，`reset` 则重置数据顺序。
+
+热启动的新输出目录会复制源 run 截止 `N` 的结构化历史，并从全局 step `N+1` 继续记录。内部的 `phase_step` 从 0 开始，因此新 optimizer 的 schedule 和 Patch lambda 属于新阶段。新 run 会立即写入新的 `global_step_N` checkpoint，从而可独立使用 `RESUME=true`。
+
 ## 当前推荐设置
 
 当前实验使用 Qwen2.5-VL-3B-Instruct、2 张 RTX 3090 24GB，并以 LoRA 进行半在线 GRPO 训练。启动脚本是 `examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh`；默认训练参数记录在 `examples/ui_s1/train.env`。
@@ -73,7 +81,7 @@ checkpoint 是完整训练状态：actor 的 FSDP/LoRA 权重、优化器、学�
 
 在启动命令中设置 `SAVE_INTERVAL_SECONDS=X`（单位：秒）即可开启定时保存，例如 `SAVE_INTERVAL_SECONDS=1800` 表示每 30 分钟保存一次。计时到期后，框架会等当前 update 的 actor 更新完成才保存，所以 checkpoint 始终对应一个完整的最新 actor step；训练结束时也会额外保存最后一步。`SAVE_LIMIT=-1` 默认保留全部断点；设为正整数可限制保留数量。
 
-要从最新断点继续，使用原来的 `RUN_NAME` 并增加 `RESUME=true`。启动脚本会读取 `RUN_DIR/checkpoint_tracker.json` 指向的最后一个完整 `global_step_*`，并恢复训练状态：
+要从最新断点继续，使用原来的 `RUN_NAME` 并增加 `RESUME=true`。未设置 `RESUME_CHECKPOINT_PATH` 时，启动脚本默认读取 `RUN_DIR/checkpoint_tracker.json` 的 `last_global_step`，并恢复其指向的最后一个完整 `global_step_*`；它不会仅按目录名猜测恢复点：
 
 `EPOCHS` / `MAX_STEPS` 要设为希望达到的总更新量，而不是“额外训练量”。例如：
 
@@ -84,11 +92,11 @@ SAVE_INTERVAL_SECONDS=1800 \
 bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 ```
 
-若 checkpoint 不在该 run 目录下，可额外指定 `RESUME_CHECKPOINT_PATH=/absolute/path/to/global_step_N`。恢复时不应使用 `trainer.save_model_only=true`，否则优化器等训练状态不存在；本启动脚本固定使用完整 checkpoint。
+要回退到同一 run 中较早的保存点，可额外指定 `RESUME_CHECKPOINT_PATH=/absolute/path/to/RUN_NAME/global_step_N`。严格续训不接受其他 run 的 checkpoint；跨 run 只继承 LoRA 应使用 `WARM_START_CHECKPOINT_PATH`。恢复时不应使用 `trainer.save_model_only=true`，否则优化器等训练状态不存在；本启动脚本固定使用完整 checkpoint。
 
 FSDP 断点只能用与保存时相同的 GPU 数恢复。当前复制到本机的历史断点是 `world_size=4` 分片，不能直接在本次 `GPU_IDS=0,1` 的两卡训练中续跑；本机新建的两卡 run 可以正常两卡续训。启动脚本会在初始化模型前检查分片数量与完整性，并对四卡断点给出明确错误。若要迁移旧权重，需要先单独合并/重分片并作为新实验启动，这不等同于恢复原优化器和 dataloader 状态。
 
-恢复时 `training_progress.log`、`train.log`、`experiment_log.jsonl` 和 `generations.log` 都会追加写入，不会清空中断前的内容。进度日志会以 `RUN | RESUME` 开始新的一段，并在随后出现 `CHECKPOINT_LOAD | START/END`；其中 `END` 的 step 就是恢复的 checkpoint step，下一次训练更新从该 step 加一开始。
+恢复前会先把 `training_progress.log`、`experiment_log.jsonl` 和 `semi_online_rollouts.jsonl` 截断到实际选中的 checkpoint。比如日志已经写到 104、但 tracker 的最新完整保存点是 99，则删除 100–104 的结构化日志后，再从 step 100 追加。无可靠 step 字段的 `train.log`、`generations.log`、GPU 峰值和奖励图片会移入 `rollback_archive/before_global_step_99/`，新活跃文件重新写入。进度日志随后以 `RUN | RESUME` 开始新的一段，并在 `CHECKPOINT_LOAD | END` 后从 checkpoint step 加一继续。
 
 Patch 模拟目标权重没有独立的可变计数器，而是由恢复后的 `global_step` 和上述 lambda 配置直接计算。例如 `global_step_N` 已包含第 N 次 actor 更新，恢复后第一次更新是 N+1，使用的指数为 N。每个 checkpoint 内的 `trainer_state.json` 会记录 step、actor world size、完整 Patch 配置和当步 lambda，并在恢复前执行强一致性校验；显式 checkpoint 路径不存在、tracker 指向的目录缺失、lambda 不一致或训练分片不完整都会直接终止，而不会静默从 step 0 开始。`experiment_config.json` 和新写入的 `experiment_config.resume.json` 仅用于人工查看与审计。
 
