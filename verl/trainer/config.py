@@ -73,6 +73,8 @@ class PatchImitationConfig:
     """multiplicative decay applied once per completed trainer update"""
     lambda_min: float = 0.0
     """lower bound for the imitation objective weight"""
+    lambda_cutoff_step: int = 0
+    """last one-based trainer update that uses imitation; 0 disables the cutoff"""
     target_mode: str = "action_only"
     """tokens supervised by imitation; currently only `action_only` is implemented"""
     history_mode: str = "keep_model_thinking"
@@ -102,6 +104,14 @@ class PatchImitationConfig:
             raise ValueError(
                 "algorithm.patch_imitation.lambda_min must not exceed algorithm.patch_imitation.lambda_initial."
             )
+        if (
+            isinstance(self.lambda_cutoff_step, bool)
+            or not isinstance(self.lambda_cutoff_step, int)
+            or self.lambda_cutoff_step < 0
+        ):
+            raise ValueError(
+                "algorithm.patch_imitation.lambda_cutoff_step must be a non-negative integer."
+            )
         if self.target_mode != "action_only":
             raise ValueError(
                 "algorithm.patch_imitation.target_mode currently supports only `action_only`; "
@@ -119,6 +129,8 @@ def compute_patch_imitation_lambda(config: PatchImitationConfig, global_step: in
     if isinstance(global_step, bool) or not isinstance(global_step, int) or global_step < 1:
         raise ValueError("global_step must be a positive integer.")
     if not config.enabled:
+        return 0.0
+    if config.lambda_cutoff_step and global_step > config.lambda_cutoff_step:
         return 0.0
 
     completed_updates_before_step = global_step - 1

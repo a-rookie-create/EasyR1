@@ -59,7 +59,7 @@ python3 -B examples/ui_s1/prepare_ui_s1_amex_rl_data.py \
 
 ## 3. AMEX 训练模式验证命令
 
-以下六组命令已经完成实际验证，覆盖普通训练、严格续训、LoRA 热启动以及 Patch 模仿学习开关的有效组合。
+以下六组验证命令覆盖普通训练、严格续训、LoRA 热启动以及 Patch 模仿学习开关的有效组合。启用模拟学习的命令统一使用 80-step 截止调度。
 
 | 训练入口 | 模拟学习关闭 | 模拟学习开启 |
 |---|---:|---:|
@@ -137,7 +137,7 @@ docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
 DATASET=amex \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-RUN_NAME=verify_matrix_patch_v2 \
+RUN_NAME=verify_matrix_patch_v3 \
 RESUME=false \
 MAX_STEPS=2 \
 GPU_IDS=0,1 \
@@ -149,8 +149,9 @@ ACTOR_LR=1.0e-5 \
 PATCH_THRESHOLD=3 \
 PATCH_IMITATION_ENABLED=true \
 PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
-PATCH_IMITATION_LAMBDA_DECAY=0.994 \
+PATCH_IMITATION_LAMBDA_DECAY=0.9433732216 \
 PATCH_IMITATION_LAMBDA_MIN=0.0 \
+PATCH_IMITATION_LAMBDA_CUTOFF_STEP=80 \
 PATCH_IMITATION_TARGET_MODE=action_only \
 PATCH_HISTORY_MODE=keep_model_thinking \
 VAL_AFTER_TRAIN=false \
@@ -159,7 +160,7 @@ bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-预期生成 step 1–2；对应的 imitation lambda 依次为 `1.0`、`0.994`，并保存 `global_step_2`。
+预期生成 step 1–2；对应的 imitation lambda 依次为 `1.0`、`0.9433732216`，并保存 `global_step_2`。
 
 ### 试验 4：从无模拟学习 checkpoint 热启动，并开启模拟学习
 
@@ -168,7 +169,7 @@ docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
 DATASET=amex \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-RUN_NAME=verify_matrix_warm_patch_from_nopatch_v2 \
+RUN_NAME=verify_matrix_warm_patch_from_nopatch_v3 \
 RESUME=false \
 WARM_START_CHECKPOINT_PATH=/home/zst/biye215/EasyR1/output/verify_matrix_nopatch_v2/global_step_4 \
 WARM_START_DATALOADER=inherit \
@@ -182,8 +183,9 @@ ACTOR_LR=1.0e-5 \
 PATCH_THRESHOLD=3 \
 PATCH_IMITATION_ENABLED=true \
 PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
-PATCH_IMITATION_LAMBDA_DECAY=0.994 \
+PATCH_IMITATION_LAMBDA_DECAY=0.9433732216 \
 PATCH_IMITATION_LAMBDA_MIN=0.0 \
+PATCH_IMITATION_LAMBDA_CUTOFF_STEP=80 \
 PATCH_IMITATION_TARGET_MODE=action_only \
 PATCH_HISTORY_MODE=keep_model_thinking \
 VAL_AFTER_TRAIN=false \
@@ -192,7 +194,7 @@ bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-预期复制源 run 的 step 1–4 历史，只继承 `global_step_4` 的 LoRA，并用新的 optimizer 和 scheduler 生成 step 5–6。新阶段的 imitation lambda 从 `1.0`、`0.994` 重新计数。
+预期复制源 run 的 step 1–4 历史，只继承 `global_step_4` 的 LoRA，并用新的 optimizer 和 scheduler 生成 step 5–6。新阶段的 imitation lambda 从 `1.0`、`0.9433732216` 重新计数。
 
 ### 试验 5：严格继续训练，开启模拟学习
 
@@ -201,7 +203,7 @@ docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
 DATASET=amex \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-RUN_NAME=verify_matrix_patch_v2 \
+RUN_NAME=verify_matrix_patch_v3 \
 RESUME=true \
 MAX_STEPS=4 \
 GPU_IDS=0,1 \
@@ -213,8 +215,9 @@ ACTOR_LR=1.0e-5 \
 PATCH_THRESHOLD=3 \
 PATCH_IMITATION_ENABLED=true \
 PATCH_IMITATION_LAMBDA_INITIAL=1.0 \
-PATCH_IMITATION_LAMBDA_DECAY=0.994 \
+PATCH_IMITATION_LAMBDA_DECAY=0.9433732216 \
 PATCH_IMITATION_LAMBDA_MIN=0.0 \
+PATCH_IMITATION_LAMBDA_CUTOFF_STEP=80 \
 PATCH_IMITATION_TARGET_MODE=action_only \
 PATCH_HISTORY_MODE=keep_model_thinking \
 VAL_AFTER_TRAIN=false \
@@ -223,7 +226,7 @@ bash examples/ui_s1/run_qwen2_5_vl_3b_ui_s1_semionline_grpo_lora.sh
 '
 ```
 
-预期从 `global_step_2` 恢复完整状态并新增 step 3–4；imitation lambda 连续衰减为约 `0.988036`、`0.982107784`。
+预期从 `global_step_2` 恢复完整状态并新增 step 3–4；imitation lambda 连续衰减为约 `0.889953035232`、`0.839557861919`。
 
 ### 试验 6：从模拟学习 checkpoint 热启动，并关闭模拟学习
 
@@ -232,9 +235,9 @@ docker exec -it -w /home/zst/biye215/EasyR1 easyr1 bash -lc '
 DATASET=amex \
 MODEL_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
 TOKENIZER_PATH=/home/zst/biye215/models/qwen2.5-vl/Qwen2.5-VL-3B-Instruct \
-RUN_NAME=verify_matrix_warm_nopatch_from_patch_v2 \
+RUN_NAME=verify_matrix_warm_nopatch_from_patch_v3 \
 RESUME=false \
-WARM_START_CHECKPOINT_PATH=/home/zst/biye215/EasyR1/output/verify_matrix_patch_v2/global_step_4 \
+WARM_START_CHECKPOINT_PATH=/home/zst/biye215/EasyR1/output/verify_matrix_patch_v3/global_step_4 \
 WARM_START_DATALOADER=inherit \
 MAX_STEPS=2 \
 GPU_IDS=0,1 \
