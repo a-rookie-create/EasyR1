@@ -84,6 +84,139 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             self.log_probs_from_logits = VF.log_probs_from_logits
 
+    @torch.no_grad()
+    def _snapshot_trainable_grads(self) -> dict[int, torch.Tensor]:
+        """Save the GRPO gradient before adding the patch-imitation term.
+
+        UI-S1 trains LoRA adapters, so this snapshot is small relative to the
+        model and lets us measure the *actual* gradient contributed by each
+        objective without an additional forward/backward pass.
+        """
+        return {
+            id(parameter): parameter.grad.detach().clone()
+            for parameter in self.actor_module.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        }
+
+    @torch.no_grad()
+    def _accumulate_patch_gradient(
+        self, accumulated_patch_grads: dict[int, torch.Tensor], grads_before_patch: dict[int, torch.Tensor]
+    ) -> dict[int, torch.Tensor]:
+        """Add this micro-batch's patch gradient to the running total."""
+        for parameter in self.actor_module.parameters():
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            previous_grad = grads_before_patch.get(id(parameter))
+            patch_grad = parameter.grad.detach()
+            if previous_grad is not None:
+                patch_grad = patch_grad - previous_grad
+            if id(parameter) in accumulated_patch_grads:
+                accumulated_patch_grads[id(parameter)].add_(patch_grad)
+            else:
+                accumulated_patch_grads[id(parameter)] = patch_grad.clone()
+        return accumulated_patch_grads
+
+    @torch.no_grad()
+    def _gradient_component_metrics(self, patch_grads: dict[int, torch.Tensor]) -> dict[str, float]:
+        """Measure GRPO, patch, and combined gradients before clipping.
+
+        FSDP stores parameter shards on each rank.  Summing squared shard
+        norms across ranks therefore gives the true global norm, rather than
+        a per-rank value that changes with the number of GPUs.
+        """
+        parameters = tuple(self.actor_module.parameters())
+        first_gradient = next(
+            (parameter.grad for parameter in parameters if parameter.grad is not None), None
+        )
+        if first_gradient is not None:
+            metric_device = first_gradient.device
+        elif parameters:
+            metric_device = parameters[0].device
+        else:
+            # Actor modules always have parameters, but keep this utility
+            # usable for a minimal unit-test module as well.
+            metric_device = torch.device("cpu")
+
+        sums = torch.zeros(3, device=metric_device, dtype=torch.float32)
+        for parameter in parameters:
+            if not parameter.requires_grad:
+                continue
+            patch_grad = patch_grads.get(id(parameter))
+            combined_grad = parameter.grad
+            if patch_grad is None and combined_grad is None:
+                continue
+
+            if combined_grad is None:
+                # This should be unreachable after backward, but retain a
+                # well-defined decomposition if an unusual module clears a
+                # gradient between the two objective terms.
+                grpo_grad = -patch_grad
+                sums[0] += torch.sum(grpo_grad.float().square())
+                sums[1] += torch.sum(patch_grad.float().square())
+                continue
+
+            combined_grad = combined_grad.detach().float()
+            if patch_grad is None:
+                patch_grad = torch.zeros_like(combined_grad)
+            else:
+                patch_grad = patch_grad.float()
+            grpo_grad = combined_grad - patch_grad
+            sums[0] += torch.sum(grpo_grad.square())
+            sums[1] += torch.sum(patch_grad.square())
+            sums[2] += torch.sum(combined_grad.square())
+
+        if isinstance(self.actor_module, FSDP) and dist.is_available() and dist.is_initialized():
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+
+        grpo_norm, patch_norm, combined_norm = torch.sqrt(sums.clamp_min(0.0)).tolist()
+        cosine_denominator = grpo_norm * patch_norm
+        # ||g_rl + g_patch||^2 = ||g_rl||^2 + ||g_patch||^2 + 2 <g_rl, g_patch>.
+        cosine = (
+            0.0
+            if cosine_denominator == 0.0
+            else (combined_norm**2 - grpo_norm**2 - patch_norm**2) / (2.0 * cosine_denominator)
+        )
+        return {
+            "actor/grpo_grad_norm": grpo_norm,
+            "actor/patch_imitation_grad_norm": patch_norm,
+            "actor/combined_grad_norm": combined_norm,
+            "actor/grpo_patch_grad_cosine": max(-1.0, min(1.0, cosine)),
+        }
+
+    @staticmethod
+    @torch.no_grad()
+    def _patch_target_metrics(log_probs: torch.Tensor, token_weights: torch.Tensor) -> dict[str, float] | None:
+        """Return target-fit metrics for expert action tokens in this update.
+
+        Target NLL is the standard, directly comparable discrepancy between
+        the policy distribution and a discrete expert target.  Its exponential
+        (perplexity) and the mean probability assigned to target tokens make
+        the same signal easier to interpret during training.
+        """
+        supervised = token_weights > 0
+        weights = token_weights.masked_select(supervised).float()
+        selected_log_probs = log_probs.masked_select(supervised).float()
+        totals = torch.stack(
+            (
+                weights.sum(),
+                torch.sum(weights * selected_log_probs),
+                torch.sum(weights * selected_log_probs.exp()),
+            )
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        weight_sum, weighted_log_prob, weighted_target_probability = totals.tolist()
+        if weight_sum <= 0.0:
+            return None
+        target_nll = -weighted_log_prob / weight_sum
+        return {
+            "actor/patch_target_nll": target_nll,
+            "actor/patch_target_perplexity": float(
+                torch.exp(torch.tensor(min(target_nll, 20.0))).item()
+            ),
+            "actor/patch_target_probability": weighted_target_probability / weight_sum,
+        }
+
     def _forward_micro_batch(self, micro_batch: dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
         """
         Returns:
@@ -275,6 +408,7 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=1)
 
             for mini_batch in mini_batches:
+                accumulated_patch_grads: dict[int, torch.Tensor] = {}
                 total_response_tokens = torch.sum(mini_batch.batch["response_mask"])
                 dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
 
@@ -320,16 +454,23 @@ class DataParallelPPOActor(BasePPOActor):
                         )
                         kl_loss = average_loss(kld, response_mask, mode=self.config.loss_avg_mode)
                         loss = pg_loss + kl_loss * self.config.kl_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
-                        metrics["actor/kl_coef"] = self.config.kl_coef
                     else:
                         loss = pg_loss
 
                     loss = loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                    # This is the complete GRPO update term: policy gradient
+                    # plus the optional KL regularizer.
                     loss.backward()
 
                     batch_metrics = {f"actor/{k}": v for k, v in pg_metrics.items()}
                     batch_metrics["actor/pg_loss"] = pg_loss.detach().item()
+                    if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
+                        batch_metrics["actor/kl_loss"] = kl_loss.detach().item()
+                        batch_metrics["actor/kl_divergence"] = kl_loss.detach().item()
+                        batch_metrics["actor/kl_regularization_loss"] = (
+                            kl_loss.detach().item() * self.config.kl_coef
+                        )
+                        batch_metrics["actor/kl_coef"] = self.config.kl_coef
 
                     if patch_imitation_enabled:
                         patch_model_inputs = {
@@ -345,18 +486,29 @@ class DataParallelPPOActor(BasePPOActor):
                         patch_objective = compute_patch_imitation_objective(
                             patch_log_probs, model_inputs["patch_token_weights"]
                         )
+                        patch_target_metrics = self._patch_target_metrics(
+                            patch_log_probs, model_inputs["patch_token_weights"]
+                        )
+                        if patch_target_metrics is not None:
+                            batch_metrics.update(patch_target_metrics)
                         # FSDP averages gradients across data-parallel ranks.
                         # The driver weights sum to one globally, hence
                         # world_size restores the intended global objective.
                         patch_gradient_term = (
                             patch_imitation_lambda * patch_objective * self.world_size * patch_minibatch_scale
                         )
+                        grads_before_patch = self._snapshot_trainable_grads()
                         (-patch_gradient_term).backward()
+                        accumulated_patch_grads = self._accumulate_patch_gradient(
+                            accumulated_patch_grads, grads_before_patch
+                        )
                         batch_metrics["actor/patch_objective"] = patch_objective.detach().item()
                         batch_metrics["actor/patch_lambda"] = patch_imitation_lambda
 
                     append_to_dict(metrics, batch_metrics)
 
+                if patch_imitation_enabled:
+                    append_to_dict(metrics, self._gradient_component_metrics(accumulated_patch_grads))
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
