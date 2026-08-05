@@ -22,6 +22,10 @@ for env_file in "${RUNTIME_ENV}" "${TRAIN_ENV}"; do
     set +a
 done
 
+# vLLM starts its EngineCore in a fresh Python process. Put the repository
+# root on PYTHONPATH so sitecustomize.py is imported in that child as well.
+export PYTHONPATH="${EASYR1_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
 case "${DATASET}" in
     android_control)
         DATA_DIR=${DATA_DIR:-${ANDROID_CONTROL_OUTPUT_DIR:?Set ANDROID_CONTROL_OUTPUT_DIR in runtime.env}}

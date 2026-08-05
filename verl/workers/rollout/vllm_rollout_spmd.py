@@ -101,6 +101,36 @@ def _install_vllm_sleep_synchronization() -> None:
     VLLMGPUWorker._easy_r1_sleep_is_synchronized = True
 
 
+def _configure_vllm_sleep_cpu_backup() -> None:
+    """Choose the host-memory backing used by vLLM's CuMem sleep path.
+
+    vLLM level-1 sleep copies model weights to CPU before releasing their GPU
+    allocations.  vLLM 0.11 requests pinned CPU memory for that backup.  On
+    this host, the pinned allocation fails with ``CUDA error: invalid
+    argument`` during ``LLM.sleep``.  Pageable CPU memory works with the same
+    synchronous ``cudaMemcpy`` operation and still releases the GPU weights;
+    the only trade-off is slower sleep/wake transfers.
+
+    The override is intentionally scoped to ``vllm.device_allocator.cumem``
+    rather than all vLLM CPU allocations.  Set ``VLLM_SLEEP_PIN_MEMORY=true``
+    to restore vLLM's original pinned-memory behavior after the CUDA/vLLM
+    runtime has been upgraded and validated.
+    """
+    raw_value = os.getenv("VLLM_SLEEP_PIN_MEMORY", "false").strip().lower()
+    if raw_value in {"true", "1", "yes"}:
+        return
+    if raw_value not in {"false", "0", "no"}:
+        raise ValueError(
+            "VLLM_SLEEP_PIN_MEMORY must be true or false, "
+            f"got {raw_value!r}."
+        )
+
+    print(
+        "vLLM sleep CPU backup: using pageable host memory "
+        "(VLLM_SLEEP_PIN_MEMORY=false)."
+    )
+
+
 def _create_vllm_model_view(model_path: str, tokenizer_path: Optional[str]) -> str:
     """Build a lightweight local model view for vLLM's VLM processor.
 
@@ -228,6 +258,8 @@ class vLLMRollout(BaseRollout):
                 engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
         _install_vllm_sleep_synchronization()
+        if config.enable_sleep_mode:
+            _configure_vllm_sleep_cpu_backup()
         VLLMHijack.hijack()
 
         self.inference_engine = LLM(
