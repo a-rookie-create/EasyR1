@@ -16,6 +16,7 @@ def _config(enabled: bool = True, **overrides):
         "lambda_initial": 0.5 if enabled else 0.0,
         "lambda_decay": 0.9,
         "lambda_min": 0.1 if enabled else 0.0,
+        "lambda_cutoff_step": 0,
         "target_mode": "action_only",
         "history_mode": "keep_model_thinking",
     }

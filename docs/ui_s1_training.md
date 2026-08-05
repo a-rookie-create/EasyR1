@@ -54,6 +54,7 @@ g_{\text{update}}=g_{\text{GRPO}}+\lambda_{\text{patch}}g_{\text{patch}}
 | `PATCH_IMITATION_LAMBDA_INITIAL` | `algorithm.patch_imitation.lambda_initial` | `0.0` | 第一次 trainer update 的模拟目标权重。开启功能时必须显式设为正数。 |
 | `PATCH_IMITATION_LAMBDA_DECAY` | `algorithm.patch_imitation.lambda_decay` | `1.0` | 每完成一次 trainer update 后的乘法衰减，取值范围为 `(0, 1]`。 |
 | `PATCH_IMITATION_LAMBDA_MIN` | `algorithm.patch_imitation.lambda_min` | `0.0` | 模拟目标权重下限，不能超过初始值。 |
+| `PATCH_IMITATION_LAMBDA_CUTOFF_STEP` | `algorithm.patch_imitation.lambda_cutoff_step` | `0` | 模拟学习参与的最后一个一基 trainer update；`0` 表示不设截止。超过该 step 后权重为零，且不构造模拟 batch 或执行模拟学习前反向。 |
 | `PATCH_IMITATION_TARGET_MODE` | `algorithm.patch_imitation.target_mode` | `action_only` | 当前只监督专家 `<tool_call>` 动作 token。 |
 | `PATCH_HISTORY_MODE` | `algorithm.patch_imitation.history_mode` | `keep_model_thinking` | rollout 历史继续保留模型自己的 thinking，不用专家内容替换。 |
 
@@ -62,14 +63,14 @@ g_{\text{update}}=g_{\text{GRPO}}+\lambda_{\text{patch}}g_{\text{patch}}
 \[
 \lambda_{\text{patch}}(s)
 =
-\max\left(
-\lambda_{\min},
-\lambda_{\text{initial}}\lambda_{\text{decay}}^{s-1}
-\right),
+\begin{cases}
+\max\left(\lambda_{\min},\lambda_{\text{initial}}\lambda_{\text{decay}}^{s-1}\right), & c=0\ \text{or}\ s\le c,\\
+0, & c>0\ \text{and}\ s>c,
+\end{cases}
 \qquad s\ge 1
 \]
 
-这里的 `global_step` 从 1 开始，因此 step 1 恰好使用 `lambda_initial`。衰减单位是完整 trainer update，而不是 patch 样本数；某一步没有可用 patch 时，调度仍由全局 step 唯一确定。
+这里的 `global_step` 从 1 开始，因此 step 1 恰好使用 `lambda_initial`，而 cutoff 参数 `c` 是 `lambda_cutoff_step`。衰减单位是完整 trainer update，而不是 patch 样本数；某一步没有可用 patch 时，调度仍由全局 step 唯一确定。
 
 当前模拟样本复用 rollout 当步的提示词与图片，并保留模型生成的 thinking 作为模拟目标权重为零的前缀；只有转换到模型坐标系后的专家动作 token 参与模拟学习。模型 thinking 在原 rollout 中保持不变，也不会被专家 thinking 替换。`thinking_and_action` 与 `replace_with_expert_thinking` 仅是后续扩展方向，目前若传入这些未实现模式，启动脚本和 dataclass 都会立即报错。
 

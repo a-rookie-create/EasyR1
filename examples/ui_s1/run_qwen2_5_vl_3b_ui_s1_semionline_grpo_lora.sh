@@ -331,6 +331,10 @@ is_number_less_than_or_equal "${PATCH_IMITATION_LAMBDA_MIN}" "${PATCH_IMITATION_
     echo "PATCH_IMITATION_LAMBDA_MIN (${PATCH_IMITATION_LAMBDA_MIN}) must not exceed PATCH_IMITATION_LAMBDA_INITIAL (${PATCH_IMITATION_LAMBDA_INITIAL})." >&2
     exit 2
 }
+is_nonnegative_integer "${PATCH_IMITATION_LAMBDA_CUTOFF_STEP}" || {
+    echo "PATCH_IMITATION_LAMBDA_CUTOFF_STEP must be a non-negative integer, got ${PATCH_IMITATION_LAMBDA_CUTOFF_STEP}." >&2
+    exit 2
+}
 if [[ "${PATCH_IMITATION_ENABLED}" == "true" ]] && ! is_positive_number "${PATCH_IMITATION_LAMBDA_INITIAL}"; then
     echo "PATCH_IMITATION_LAMBDA_INITIAL must be positive when PATCH_IMITATION_ENABLED=true." >&2
     exit 2
@@ -487,6 +491,7 @@ python3 -m verl.trainer.main \
     algorithm.patch_imitation.lambda_initial=${PATCH_IMITATION_LAMBDA_INITIAL} \
     algorithm.patch_imitation.lambda_decay=${PATCH_IMITATION_LAMBDA_DECAY} \
     algorithm.patch_imitation.lambda_min=${PATCH_IMITATION_LAMBDA_MIN} \
+    algorithm.patch_imitation.lambda_cutoff_step=${PATCH_IMITATION_LAMBDA_CUTOFF_STEP} \
     algorithm.patch_imitation.target_mode=${PATCH_IMITATION_TARGET_MODE} \
     algorithm.patch_imitation.history_mode=${PATCH_HISTORY_MODE} \
     algorithm.use_kl_loss=true \

@@ -83,12 +83,13 @@ class Role(IntEnum):
 
 
 PATCH_IMITATION_TRAINER_STATE = "trainer_state.json"
-PATCH_IMITATION_STATE_VERSION = 1
+PATCH_IMITATION_STATE_VERSION = 2
 PATCH_IMITATION_CONFIG_FIELDS = (
     "enabled",
     "lambda_initial",
     "lambda_decay",
     "lambda_min",
+    "lambda_cutoff_step",
     "target_mode",
     "history_mode",
 )
@@ -1792,20 +1793,19 @@ class RayPPOTrainer:
                 if self.config.trainer.critic_warmup <= self.phase_step:
                     self._progress("ACTOR_UPDATE", "START")
                     with timer("update_actor", timing_raw):
-                        if (
-                            self.config.algorithm.semi_online
-                            and self.config.algorithm.patch_imitation.enabled
-                        ):
-                            from examples.ui_s1.patch_imitation import attach_patch_imitation_tensors
-
+                        if self.config.algorithm.semi_online and self.config.algorithm.patch_imitation.enabled:
                             patch_imitation_lambda = compute_patch_imitation_lambda(
                                 self.config.algorithm.patch_imitation, self.phase_step
                             )
-                            patch_metrics = attach_patch_imitation_tensors(batch, self.tokenizer)
-                            patch_metrics["patch_imitation/lambda"] = patch_imitation_lambda
-                            metrics.update(patch_metrics)
-                            if patch_metrics["patch_imitation/valid_samples"] > 0:
-                                batch.meta_info["patch_imitation_lambda"] = patch_imitation_lambda
+                            metrics["patch_imitation/lambda"] = patch_imitation_lambda
+                            if patch_imitation_lambda > 0.0:
+                                from examples.ui_s1.patch_imitation import attach_patch_imitation_tensors
+
+                                patch_metrics = attach_patch_imitation_tensors(batch, self.tokenizer)
+                                patch_metrics["patch_imitation/lambda"] = patch_imitation_lambda
+                                metrics.update(patch_metrics)
+                                if patch_metrics["patch_imitation/valid_samples"] > 0:
+                                    batch.meta_info["patch_imitation_lambda"] = patch_imitation_lambda
 
                         actor_batch = batch
                         if self.config.algorithm.semi_online:
@@ -1819,7 +1819,7 @@ class RayPPOTrainer:
                             actor_batch, actor_padding_size = pad_dataproto_to_divisor(
                                 batch, actor_update_divisor
                             )
-                            if self.config.algorithm.patch_imitation.enabled:
+                            if "patch_input_ids" in actor_batch.batch:
                                 from examples.ui_s1.patch_imitation import zero_patch_imitation_padding
 
                                 zero_patch_imitation_padding(actor_batch, actor_padding_size)
