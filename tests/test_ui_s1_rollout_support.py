@@ -8,9 +8,11 @@ from PIL import Image
 from verl.trainer.ray_trainer import (
     RayPPOTrainer,
     _as_object_array,
+    _advance_strict_validation_state,
     _build_semi_online_prompt,
     _compact_ui_action,
     _select_most_diverse_rollout_subset,
+    _strict_validation_trajectory_metrics,
     _thinking_for_history,
 )
 from verl.utils.dataset import RLHFDataset, qwen_coordinate_transform, qwen_coordinate_transforms
@@ -42,6 +44,98 @@ def test_rollout_history_keeps_only_thinking_and_discards_action():
     response = '<thinking>Open it.</thinking><tool_call>{"name":"mobile_use","arguments":{"action":"open","text":"Calendar"}}</tool_call>'
     assert _thinking_for_history(response) == "<thinking>\nOpen it.\n</thinking>"
     assert _thinking_for_history("<tool_call>{}</tool_call>") is None
+
+
+def _strict_validation_state(step_count=3):
+    return {
+        "steps": [{"step_id": step_id} for step_id in range(step_count)],
+        "step_pos": 0,
+        "history": [],
+        "matched_steps": 0,
+        "evaluated_steps": 0,
+        "cumulative_reward": 0.0,
+        "first_error_position": None,
+        "success": False,
+        "finished": False,
+    }
+
+
+def test_strict_validation_advances_only_after_a_matching_action():
+    state = _strict_validation_state(step_count=2)
+    response = "<thinking>Open it.</thinking><tool_call>{}</tool_call>"
+
+    assert _advance_strict_validation_state(state, response, {"overall": 1.0, "accuracy": 1.0})
+    assert state["step_pos"] == 1
+    assert state["matched_steps"] == 1
+    assert state["evaluated_steps"] == 1
+    assert state["history"] == ["<thinking>\nOpen it.\n</thinking>"]
+    assert not state["finished"]
+
+    assert not _advance_strict_validation_state(
+        state,
+        "<thinking>Wrong target.</thinking><tool_call>{}</tool_call>",
+        {"overall": 0.5, "accuracy": 0.0},
+    )
+    assert state["step_pos"] == 1
+    assert state["matched_steps"] == 1
+    assert state["evaluated_steps"] == 2
+    assert state["first_error_position"] == 2
+    assert state["finished"]
+    assert not state["success"]
+    # Failed reasoning never enters the prompt history for a nonexistent next step.
+    assert state["history"] == ["<thinking>\nOpen it.\n</thinking>"]
+
+
+def test_strict_validation_reaching_the_last_step_marks_trajectory_success():
+    state = _strict_validation_state(step_count=1)
+
+    assert _advance_strict_validation_state(
+        state,
+        "<thinking>Finish.</thinking><tool_call>{}</tool_call>",
+        {"overall": 1.0, "accuracy": 1.0},
+    )
+    assert state["finished"]
+    assert state["success"]
+    assert state["matched_steps"] == 1
+    assert state["first_error_position"] is None
+
+
+def test_strict_validation_metrics_report_success_completion_and_first_error():
+    success = _strict_validation_state(step_count=3)
+    success.update(
+        matched_steps=3,
+        evaluated_steps=3,
+        cumulative_reward=3.0,
+        success=True,
+        finished=True,
+        step_pos=3,
+    )
+    failure = _strict_validation_state(step_count=4)
+    failure.update(
+        matched_steps=2,
+        evaluated_steps=3,
+        cumulative_reward=2.5,
+        first_error_position=3,
+        finished=True,
+        step_pos=2,
+    )
+
+    metrics = _strict_validation_trajectory_metrics([success, failure])
+
+    assert metrics["val/trajectory_success_rate"] == 0.5
+    assert metrics["val/trajectory_failure_rate"] == 0.5
+    assert metrics["val/trajectory_completion_ratio_mean"] == 0.75
+    assert metrics["val/trajectory_matched_steps_mean"] == 2.5
+    assert metrics["val/trajectory_evaluated_steps_mean"] == 3.0
+    assert metrics["val/trajectory_first_error_position_mean"] == 3.0
+
+
+def test_semi_online_validation_routes_to_strict_no_patch_path():
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.config = SimpleNamespace(algorithm=SimpleNamespace(semi_online=True))
+    trainer._validate_semi_online_strict = lambda: {"val/trajectory_success_rate": 0.25}
+
+    assert trainer._validate() == {"val/trajectory_success_rate": 0.25}
 
 
 def test_qwen_transform_uses_final_grid_dimensions_not_only_pixel_budget():

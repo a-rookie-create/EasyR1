@@ -152,7 +152,7 @@ Patch 模拟目标权重没有独立的可变计数器，而是由恢复后的 `
 | `WORKERS` | 创建 Ray worker，并初始化 actor、reference、vLLM rollout engine、reward 等角色；实际模型权重初始化主要发生在此阶段。 |
 | `TRAINING_LOOP` | 训练主循环开始或结束。`planned_steps` 是本次有效的更新次数。 |
 | `CHECKPOINT_LOAD` | 尝试恢复 checkpoint。`SKIP` 表示本次没有要求恢复。 |
-| `VALIDATION` | 验证开始、进度或结束。`START` 记录总 batch 数和生成数；`PROGRESS` 每 25 个 batch 记录一次已完成数量、当前 overall reward 均值和耗时；`END` 记录总耗时与核心验证 reward。 |
+| `VALIDATION` | 验证开始、进度或结束。UI-S1 使用 `strict_trajectory_no_patch`：从第一步开始，动作匹配才进入下一张专家截图，第一次不匹配立即结束，完整匹配所有步骤才算轨迹成功。`PROGRESS` 记录已完成轨迹数、当前轨迹成功率、overall reward 均值和耗时。 |
 | `VALIDATION_ENGINE_SYNC` | 验证前将 actor 权重同步到 vLLM。 |
 | `VALIDATION_ENGINE_RELEASE` | 验证结束后让 vLLM sleep/offload。 |
 
@@ -201,4 +201,4 @@ throughput = total_num_tokens / step_elapsed_s / GPU 数
 
 ## 当前日志的已知边界
 
-目前 `training_progress.log` 已覆盖训练初始化、rollout、奖励、筛选、概率计算、actor 更新和 validation。验证固定使用 `data.val_batch_size=1`，在验证集较大时可能占用明显时间；因此只记录开始、每 25 batch 的进度、结束和 vLLM 切换，不写逐样本日志。
+目前 `training_progress.log` 已覆盖训练初始化、rollout、奖励、筛选、概率计算、actor 更新和 validation。UI-S1 验证固定使用 `data.val_batch_size=1`，并执行严格的无 Patch 多步轨迹验证；它不会在动作错误后借用专家动作继续，因此 `val/trajectory_success_rate` 表示完整轨迹所有动作均匹配的比例，`val/trajectory_completion_ratio_mean` 表示首次错误前平均完成的轨迹比例。验证集较大时可能占用明显时间，因此只记录开始、每 25 batch 的进度、结束和 vLLM 切换，不写逐样本日志。

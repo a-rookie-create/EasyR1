@@ -389,6 +389,57 @@ def _build_semi_online_prompt(
     return content
 
 
+def _advance_strict_validation_state(
+    state: dict[str, Any], response_text: str, reward: dict[str, float]
+) -> bool:
+    """Advance one no-patch validation trajectory only after an exact action match."""
+    if state["finished"]:
+        raise RuntimeError("Cannot advance a finished strict-validation trajectory.")
+
+    state["evaluated_steps"] += 1
+    state["cumulative_reward"] += float(reward.get("overall", 0.0))
+    matched = float(reward.get("accuracy", 0.0)) >= 1.0
+    if not matched:
+        state["first_error_position"] = state["step_pos"] + 1
+        state["finished"] = True
+        return False
+
+    thinking = _thinking_for_history(response_text)
+    if thinking is not None:
+        state["history"].append(thinking)
+    state["matched_steps"] += 1
+    state["step_pos"] += 1
+    if state["step_pos"] >= len(state["steps"]):
+        state["success"] = True
+        state["finished"] = True
+    return True
+
+
+def _strict_validation_trajectory_metrics(states: list[dict[str, Any]]) -> dict[str, float]:
+    """Summarize strict no-patch trajectory outcomes."""
+    if not states:
+        raise RuntimeError("Strict trajectory validation produced no trajectories.")
+
+    successful = [state for state in states if state["success"]]
+    failures = [state for state in states if not state["success"]]
+    completion_ratios = [state["matched_steps"] / len(state["steps"]) for state in states]
+    first_error_positions = [state["first_error_position"] for state in failures]
+    return {
+        "val/trajectory_success_rate": float(len(successful) / len(states)),
+        "val/trajectory_failure_rate": float(len(failures) / len(states)),
+        "val/trajectory_completion_ratio_mean": float(np.mean(completion_ratios)),
+        "val/trajectory_matched_steps_mean": float(np.mean([state["matched_steps"] for state in states])),
+        "val/trajectory_evaluated_steps_mean": float(np.mean([state["evaluated_steps"] for state in states])),
+        "val/trajectory_total_steps_mean": float(np.mean([len(state["steps"]) for state in states])),
+        "val/trajectory_cumulative_reward_mean": float(np.mean([state["cumulative_reward"] for state in states])),
+        "val/trajectory_first_error_position_mean": (
+            float(np.mean(first_error_positions)) if first_error_positions else 0.0
+        ),
+        "val/trajectory_count": float(len(states)),
+        "val/trajectory_failure_count": float(len(failures)),
+    }
+
+
 def _attach_ui_s1_advantages(data: DataProto, config: PPOConfig) -> dict[str, float]:
     """Attach UI-S1 equations (9)-(12) without changing the generic GRPO path."""
     # Keep UI-S1 experiment code out of EasyR1's normal trainer import path.
@@ -861,6 +912,9 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> dict[str, Any]:
+        if self.config.algorithm.semi_online:
+            return self._validate_semi_online_strict()
+
         validation_started = time.perf_counter()
         reward_tensor_lst = []
         # Lists to collect samples for the table
@@ -957,6 +1011,212 @@ class RayPPOTrainer:
             "END",
             elapsed_s=time.perf_counter() - validation_started,
             completed_prompts=completed_prompts,
+            overall_reward=validation_result.get("val/overall_reward"),
+            accuracy_reward=validation_result.get("val/accuracy_reward"),
+        )
+        return validation_result
+
+    def _validate_semi_online_strict(self) -> dict[str, Any]:
+        """Validate complete UI-S1 trajectories without expert-action patches.
+
+        A trajectory advances to its next expert screenshot only when the model
+        action matches the current expert action.  The first mismatch terminates
+        that trajectory, so reaching the end means every action was correct.
+        """
+        validation_started = time.perf_counter()
+        reward_tensor_lst = []
+        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
+        reward_metrics_lst = defaultdict(list)
+        length_metrics_lst = defaultdict(list)
+        trajectory_states: list[dict[str, Any]] = []
+        total_batches = len(self.val_dataloader)
+        progress_interval = self.config.trainer.progress_validation_interval
+        if progress_interval < 1:
+            raise ValueError("trainer.progress_validation_interval must be positive")
+
+        val_override_config = dict(self.config.worker.rollout.val_override_config)
+        if int(val_override_config.get("n", 1)) != 1:
+            raise ValueError("Strict UI-S1 trajectory validation requires worker.rollout.val_override_config.n=1.")
+        image_limit = self.config.algorithm.semi_online_image_limit
+        generation_micro_batch_size = self.config.algorithm.semi_online_generation_micro_batch_size
+        if image_limit < 1:
+            raise ValueError("algorithm.semi_online_image_limit must be at least 1")
+        if generation_micro_batch_size < 0:
+            raise ValueError("algorithm.semi_online_generation_micro_batch_size must be non-negative")
+
+        print("Start strict no-patch UI-S1 trajectory validation...")
+        self._progress(
+            "VALIDATION",
+            "START",
+            mode="strict_trajectory_no_patch",
+            total_batches=total_batches,
+            batch_size=self.config.data.val_batch_size,
+            generation_n=1,
+        )
+        validation_sync_started = time.perf_counter()
+        self._progress("VALIDATION_ENGINE_SYNC", "START", direction="actor_to_vllm")
+        self.actor_rollout_ref_wg.prepare_rollout_engine()
+        self._progress("VALIDATION_ENGINE_SYNC", "END", elapsed_s=time.perf_counter() - validation_sync_started)
+
+        for batch_index, batch_dict in enumerate(self.val_dataloader, start=1):
+            source_batch = DataProto.from_single_dict(batch_dict)
+            if "trajectory_steps" not in source_batch.non_tensor_batch:
+                raise RuntimeError(
+                    "Strict UI-S1 validation requires trajectory-level validation data with `trajectory_steps`."
+                )
+
+            batch_states = []
+            for row_idx in range(len(source_batch)):
+                steps = list(source_batch.non_tensor_batch["trajectory_steps"][row_idx])
+                if not steps:
+                    raise RuntimeError("Strict UI-S1 validation received an empty expert trajectory.")
+                task_id = str(
+                    source_batch.non_tensor_batch.get("task_id", np.array([row_idx], dtype=object))[row_idx]
+                )
+                state = {
+                    "task_id": task_id,
+                    "traj_uid": f"validation:{uuid.uuid4()}",
+                    "goal": str(source_batch.non_tensor_batch["goal"][row_idx]),
+                    "steps": steps,
+                    "step_pos": 0,
+                    "history": [],
+                    "matched_steps": 0,
+                    "evaluated_steps": 0,
+                    "cumulative_reward": 0.0,
+                    "first_error_position": None,
+                    "success": False,
+                    "finished": False,
+                }
+                batch_states.append(state)
+                trajectory_states.append(state)
+
+            while active_states := [state for state in batch_states if not state["finished"]]:
+                all_examples = []
+                for state in active_states:
+                    step = state["steps"][state["step_pos"]]
+                    step_id = step.get("step_id", state["step_pos"])
+                    image_start = max(0, state["step_pos"] - image_limit + 1)
+                    images = [item["image"] for item in state["steps"][image_start : state["step_pos"] + 1]]
+                    all_examples.append(
+                        {
+                            "prompt": _build_semi_online_prompt(
+                                state["goal"],
+                                state["history"],
+                                image_count=len(images),
+                                format_prompt=self._semi_online_format_prompt,
+                            ),
+                            "answer": json.dumps(
+                                _compact_ui_action(step["action"]), ensure_ascii=False, separators=(",", ":")
+                            ),
+                            "images": images,
+                            "uid": f"validation:{state['task_id']}:{step_id}",
+                            "traj_uid": state["traj_uid"],
+                            "step_id": step_id,
+                            "task_id": state["task_id"],
+                            "rollout_id": 0,
+                            "selection_group_key": f"validation:{state['task_id']}",
+                            "state": state,
+                        }
+                    )
+
+                chunk_size = generation_micro_batch_size or len(all_examples)
+                for chunk_start in range(0, len(all_examples), chunk_size):
+                    examples = all_examples[chunk_start : chunk_start + chunk_size]
+                    encode_meta_info = {
+                        "min_pixels": self.config.data.min_pixels,
+                        "max_pixels": self.config.data.max_pixels,
+                        "video_fps": self.config.data.video_fps,
+                        "n": 1,
+                    }
+                    step_batch = self._encode_semi_online_examples(examples, meta_info=encode_meta_info)
+                    gen_batch = step_batch.pop(
+                        batch_keys=["input_ids", "attention_mask", "position_ids"],
+                        non_tensor_batch_keys=["raw_prompt_ids", "multi_modal_data"],
+                        meta_info_keys=["min_pixels", "max_pixels", "video_fps"],
+                    )
+                    gen_batch.meta_info.update(val_override_config)
+                    gen_batch.meta_info["n"] = 1
+                    gen_batch, pad_size = pad_dataproto_to_divisor(
+                        gen_batch, self.actor_rollout_ref_wg.world_size
+                    )
+                    gen_output = self.actor_rollout_ref_wg.generate_sequences(gen_batch)
+                    gen_output = unpad_dataproto(gen_output, pad_size=pad_size)
+                    step_batch = step_batch.union(gen_output)
+
+                    reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(step_batch))
+                    reward_tensor_lst.append(reward_tensor)
+                    for key, values in reward_metrics.items():
+                        reward_metrics_lst[key].extend(values)
+                    for key, values in get_length_metric_samples(step_batch).items():
+                        length_metrics_lst[key].extend(values.detach().cpu().tolist())
+
+                    input_texts = [
+                        self.tokenizer.decode(ids, skip_special_tokens=True) for ids in step_batch.batch["prompts"]
+                    ]
+                    response_lengths = torch.sum(step_batch.batch["response_mask"], dim=-1)
+                    for row_idx, example in enumerate(examples):
+                        response_len = int(response_lengths[row_idx].item())
+                        response_ids = step_batch.batch["responses"][row_idx, :response_len]
+                        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+                        reward = {
+                            key: float(values[row_idx])
+                            for key, values in reward_metrics.items()
+                            if row_idx < len(values)
+                        }
+                        _advance_strict_validation_state(example["state"], response_text, reward)
+
+                        sample_inputs.append(input_texts[row_idx])
+                        sample_outputs.append(response_text)
+                        sample_labels.append(example["answer"])
+                        sample_scores.append(float(reward_tensor[row_idx].sum().item()))
+
+            if batch_index % progress_interval == 0 or batch_index == total_batches:
+                completed_states = trajectory_states
+                successful_count = sum(state["success"] for state in completed_states)
+                overall_rewards = reward_metrics_lst.get("overall", [])
+                self._progress(
+                    "VALIDATION",
+                    "PROGRESS",
+                    mode="strict_trajectory_no_patch",
+                    completed_batches=batch_index,
+                    total_batches=total_batches,
+                    completed_trajectories=len(completed_states),
+                    trajectory_success_rate=(
+                        successful_count / len(completed_states) if completed_states else None
+                    ),
+                    overall_reward_mean=float(np.mean(overall_rewards)) if overall_rewards else None,
+                    elapsed_s=time.perf_counter() - validation_started,
+                )
+
+        validation_release_started = time.perf_counter()
+        self._progress("VALIDATION_ENGINE_RELEASE", "START")
+        self.actor_rollout_ref_wg.release_rollout_engine()
+        self._progress("VALIDATION_ENGINE_RELEASE", "END", elapsed_s=time.perf_counter() - validation_release_started)
+        self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
+
+        if not reward_tensor_lst:
+            raise RuntimeError("Strict UI-S1 trajectory validation produced no action evaluations.")
+        self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
+        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
+        val_length_metrics = {
+            f"val_{key}": value for key, value in reduce_length_metric_samples(length_metrics_lst).items()
+        }
+        trajectory_metrics = _strict_validation_trajectory_metrics(trajectory_states)
+        validation_result = {
+            "val/reward_score": self.val_reward_score,
+            **val_reward_metrics,
+            **val_length_metrics,
+            **trajectory_metrics,
+        }
+        print("Finish strict no-patch UI-S1 trajectory validation.")
+        self._progress(
+            "VALIDATION",
+            "END",
+            mode="strict_trajectory_no_patch",
+            elapsed_s=time.perf_counter() - validation_started,
+            completed_trajectories=len(trajectory_states),
+            trajectory_success_rate=trajectory_metrics["val/trajectory_success_rate"],
+            completion_ratio=trajectory_metrics["val/trajectory_completion_ratio_mean"],
             overall_reward=validation_result.get("val/overall_reward"),
             accuracy_reward=validation_result.get("val/accuracy_reward"),
         )
